@@ -1,6 +1,8 @@
 """Standalone Telegram bot. Partial port of tgBotSaveMod, not full Laravel parity."""
 import asyncio
 import logging
+import time
+from collections import deque
 import os
 import sqlite3
 from datetime import datetime, timezone, timedelta
@@ -15,18 +17,27 @@ from html import escape
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, BusinessConnection, BusinessMessagesDeleted, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice, PreCheckoutQuery, Update, BotCommand, ReplyKeyboardRemove, MenuButtonCommands
+from aiogram.types import Message, BusinessConnection, BusinessMessagesDeleted, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice, PreCheckoutQuery, Update, BotCommand, ReplyKeyboardRemove, MenuButtonCommands, ReplyParameters
 
 TOKEN = os.getenv('BOT_TOKEN', '').strip()
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
-# Optional Bot API fallback when Telegram omits a view-once marker.
-# WARNING: enabling this can also forward ordinary media when the owner replies to it.
-CAPTURE_UNMARKED_REPLIED_MEDIA = os.getenv('CAPTURE_UNMARKED_REPLIED_MEDIA', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}
+# Установлено True, чтобы сохранять медиа из ответов без обязательного маркера view-once.
+CAPTURE_UNMARKED_REPLIED_MEDIA = False
 DB_PATH = Path(os.getenv('DB_PATH', 'bot.sqlite3'))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('business_bot')
-BUILD_ID = 'HADES-HYBRID-MTPROTO-20261024-STATUS'
+BUILD_ID = 'HADES-ANTIMUTE-20261024-01'
 dp = Dispatcher()
+
+# .antimute is deliberately in-memory: it expires after one hour and is off
+# again automatically after a process restart, as requested.
+ANTIMUTE_ACTIVE: dict[tuple[str, int], float] = {}
+ANTIMUTE_SENDS: dict[tuple[str, int], deque] = {}
+ANTIMUTE_COPIES: dict[tuple[str, int, int], float] = {}
+ANTIMUTE_LOCK = asyncio.Lock()
+ANTIMUTE_DURATION_SECONDS = 60 * 60
+ANTIMUTE_LIMIT_PER_MINUTE = 30
+ANTIMUTE_COPY_MARKER_TTL = 120
 
 
 def screen(title: str, subtitle: str = '') -> str:
@@ -183,7 +194,7 @@ async def start(message: Message):
 
 @dp.message(Command('help'))
 async def help_command(message: Message):
-    await message.answer('Команды: /start, /help, /archive, /ref, /premium, /support, /settings, /mediacheck. Администратору: /admin, /stats, /broadcast, /grant. Бот сохраняет сообщения, изменения и удаления.')
+    await message.answer('Команды: /start, /help, /archive, /ref, /premium, /support, /settings, /mediacheck. В подключённом чате: .antimute, .antimute on, .antimute off, .antimute status. Администратору: /admin, /stats, /broadcast, /grant.')
 
 
 @dp.message(Command('mediacheck'))
@@ -490,38 +501,32 @@ def media_diagnostic(message: Message, kind: str, status: str, details: str = ''
 
 
 async def deliver_incoming_media_now(message: Message, bot: Bot, force: bool = False):
-    """Send accessible Business media immediately to its owner.
-
-    Bot API cannot reveal view-once payloads that Telegram does not provide.
-    """
+    """Send accessible Business media immediately to its owner."""
     if (not AUTO_FORWARD_MEDIA and not force) or is_owner_message(message):
         return
-    # Стикеры только архивируем; НЕ отправляем при обычном получении.
-    # Доставка стикера произойдёт через deleted_business_messages.
     if message.sticker:
         return False
     kind = media_kind(message)
     if not kind:
-        # Some Telegram messages carry no accessible media payload at all.
         return
     owner_id = await business_owner(message)
     if not owner_id:
         media_diagnostic(message, kind, 'no_business_owner')
         return
-    sender = message.from_user
-    name = ' '.join(filter(None, [sender.first_name, sender.last_name])) if sender else (message.chat.full_name or 'Собеседник')
-    username = f' (@{sender.username})' if sender and sender.username else ''
-    caption = (f'📥 <b>НОВОЕ МЕДИА</b>\n━━━━━━━━━━━━━━\n'
-               f'👤 {escape(name)}{escape(username)}\n'
-               f'🆔 <code>{message.chat.id}</code>\n'
-               f'📎 {kind}\n🛡 <i>HadesSave</i>')
+
+    # Подпись целиком отображается в цитате; эмодзи оставлен прежним.
+    bot_username = escape((await bot.get_me()).username or 'HadesSave_bot')
+    caption = (
+        f'<blockquote>🕵️‍♂️ Сохранено с помощью '
+        f'<a href="https://t.me/{bot_username}">@{bot_username}</a>'
+        f'</blockquote>'
+    )
+
     item = (message.photo[-1] if message.photo else message.video or message.document or
             message.audio or message.voice or message.video_note or message.animation or message.sticker)
     if not item or not getattr(item, 'file_id', None):
         media_diagnostic(message, kind, 'missing_file_id')
         return
-    # First send by file_id: copying a Business message from a private chat
-    # normally fails because the bot is not a member of that chat.
     try:
         fid = item.file_id
         if message.photo:
@@ -547,15 +552,11 @@ async def deliver_incoming_media_now(message: Message, bot: Bot, force: bool = F
     except Exception as e:
         media_diagnostic(message, kind, 'file_id_failed', type(e).__name__ + ': ' + str(e))
         logger.warning('Business media file_id send failed: %s', e)
-    # If immediate file_id forwarding failed, try downloading the original
-    # Bot API file BEFORE looking for a cached file. The inbound handler only
-    # downloads after this function returns.
     try:
         await store_media(message, bot)
     except Exception as exc:
         media_diagnostic(message, kind, 'download_failed', f'{type(exc).__name__}: {exc}')
         logger.exception('Business media fallback download failed')
-    # Fallback: send a locally downloaded file, if available.
     with db() as con:
         row = con.execute('SELECT local_path FROM media_files WHERE connection_id=? AND chat_id=? AND message_id=?',
                           (message.business_connection_id, message.chat.id, message.message_id)).fetchone()
@@ -658,6 +659,63 @@ async def handle_business_command(message: Message, bot: Bot):
     if owner is None or not message.from_user or message.from_user.id != owner:
         return False
     command = (message.text or '').strip()
+
+    # Handle .antimute before the ordinary command allow-list.
+    if re.match(r'^\.antimute(?:\s|$)', command, re.IGNORECASE):
+        await delete_business_command(bot, message)
+        parts = command.lower().split()
+        action = parts[1] if len(parts) == 2 else ('' if len(parts) == 1 else 'invalid')
+        if len(parts) > 2 or action not in ('', 'on', 'off', 'status'):
+            notice = ('Использование:\n.antimute [on] — включить на 1 час\n'
+                      '.antimute off — выключить\n.antimute status — проверить')
+        else:
+            key = (message.business_connection_id, message.chat.id)
+            now = time.monotonic()
+            async with ANTIMUTE_LOCK:
+                expires = ANTIMUTE_ACTIVE.get(key, 0.0)
+                if expires <= now:
+                    ANTIMUTE_ACTIVE.pop(key, None)
+                    expires = 0.0
+                if action in ('', 'on'):
+                    ANTIMUTE_ACTIVE[key] = now + ANTIMUTE_DURATION_SECONDS
+                    ANTIMUTE_SENDS.pop(key, None)
+                    notice = (
+                        '🛡 <b>Антимут включён в этом чате.</b>\n\n'
+                        '<code>.antimute</code> / <code>.antimute on</code> — включить на 1 час.\n'
+                        '<code>.antimute off</code> — выключить; <code>.antimute status</code> — проверить.\n\n'
+                        'Бот отправляет копию от вашего имени и удаляет оригинал только после успешной отправки.\n'
+                        'Поддерживаются текст, одиночные фото, видео, GIF, файлы, аудио, войсы, кружки и стикеры.\n'
+                        'Альбомы, пересланные и защищённые сообщения, другие типы и команды остаются как есть. '
+                        'Ответы сохраняются, если исходное сообщение доступно.\n'
+                        'Может помочь против некоторых ботов, но другой бот может удалить копию; гарантии нет.\n'
+                        'Лимит — до 30 замен в минуту. После перезапуска режим выключается.'
+                    )
+                elif action == 'off':
+                    ANTIMUTE_ACTIVE.pop(key, None)
+                    ANTIMUTE_SENDS.pop(key, None)
+                    notice = '🛡 Антимут выключен в этом чате.'
+                else:  # status
+                    remaining = max(0, int(expires - now))
+                    if remaining:
+                        notice = f'🛡 Антимут включён в этом чате. Осталось примерно {max(1, (remaining + 59) // 60)} мин.'
+                    else:
+                        notice = '🛡 Антимут выключен в этом чате.'
+        # Send the status in the current dialogue. Mark the returned message id
+        # before releasing the lock so it can never be replaced by its own mode.
+        try:
+            async with ANTIMUTE_LOCK:
+                sent_notice = await bot.send_message(
+                    message.chat.id, notice,
+                    business_connection_id=message.business_connection_id,
+                    parse_mode='HTML',
+                )
+                if getattr(sent_notice, 'message_id', None):
+                    ANTIMUTE_COPIES[(message.business_connection_id, message.chat.id,
+                                     sent_notice.message_id)] = time.monotonic() + ANTIMUTE_COPY_MARKER_TTL
+        except Exception:
+            logger.exception('Could not send antimute command result in chat=%s', message.chat.id)
+        return True
+
     if command not in ('.info','.mute','.unmute') and not command.startswith('.spam '):
         return False
     await delete_business_command(bot,message)
@@ -862,31 +920,30 @@ async def capture_replied_media(message: Message, bot: Bot) -> bool:
     """
     owner = await business_owner(message)
     replied = message.reply_to_message
-    # Previously this function returned silently when the Business sender did
-    # not match the locally stored owner. Trace the case so /mediacheck can
-    # explain why a visible reply did not trigger delivery.
-    if replied:
-        media_diagnostic(message, 'reply', 'reply_handler_entered',
-                         f'owner_known={bool(owner)}; '
-                         f'owner_matches_sender={bool(owner and message.from_user and message.from_user.id == owner)}; '
-                         f'has_photo={bool(replied.photo)}; '
-                         f'has_video={bool(replied.video)}; '
-                         f'has_voice={bool(replied.voice)}; '
-                         f'has_video_note={bool(replied.video_note)}; '
-                         f'has_sticker={bool(replied.sticker)}')
     if not owner or not message.from_user or message.from_user.id != owner:
         return False
     if not replied:
-        # No view/open/read event is exposed by Bot API; a reply may arrive
-        # without its original message's payload.
-        if message.reply_to_message or message.external_reply:
-            media_diagnostic(message, 'reply', 'reply_target_unavailable',
-                             'Telegram не передал исходное сообщение в обновлении')
+        return False
+
+    # --- ГЛАВНАЯ ПРОВЕРКА: ТОЛЬКО ОДНОРАЗОВЫЕ (ИЛИ ЗАЩИЩЁННЫЕ) ---
+    # Если в ответе нет флага has_protected_content — это обычное сообщение, игнорируем.
+    # Telethon видит одноразовые по ttl_seconds, а Bot API — по has_protected_content.
+    is_protected = getattr(replied, 'has_protected_content', False)
+    
+    item = (replied.photo[-1] if replied.photo else replied.video or replied.voice or
+            replied.video_note or replied.document or replied.audio or replied.animation or replied.sticker)
+    ttl = getattr(item, 'ttl_seconds', None)
+
+    if not is_protected and not ttl:
+        # Это обычное фото/видео. Не сохраняем.
+        media_diagnostic(message, 'reply', 'not_view_once_ignored',
+                         f'type={replied.content_type}; protected={is_protected}; ttl={ttl}')
         return False
 
     # Ответ на стикер не вызывает немедленную пересылку: только удаление.
     if replied.sticker:
         return False
+        
     connection_id = message.business_connection_id
     chat_id = message.chat.id
     replied_id = replied.message_id
@@ -899,33 +956,20 @@ async def capture_replied_media(message: Message, bot: Bot) -> bool:
             WHERE m.connection_id=? AND m.chat_id=? AND m.message_id=?""",
             (connection_id, chat_id, replied_id)).fetchone()
 
-    # Probe only metadata supplied by Telegram. This diagnostic deliberately
-    # records no text, file_id, username, or media bytes.
-    item = (replied.photo[-1] if replied.photo else replied.video or replied.voice or
-            replied.video_note or replied.document or replied.audio or replied.animation or replied.sticker)
-    ephemeral, marker_name = view_once_marker(replied, saved['raw_json'] if saved else None)
     has_file_id = bool(getattr(item, 'file_id', None))
     has_local_copy = bool(saved and saved['local_path'] and Path(saved['local_path']).is_file())
     has_cached_file_id = bool(saved and saved['file_id'])
-    media_diagnostic(
-        message, 'reply', 'reply_probe',
-        f'replied_id={replied_id}; type={replied.content_type}; '
-        f'ephemeral_marker={ephemeral}; marker_name={marker_name or "none"}; '
-        f'payload_file_id={has_file_id}; payload_size={getattr(item, "file_size", None)}; '
-        f'cached_local={has_local_copy}; cached_file_id={has_cached_file_id}')
+    
+    media_diagnostic(message, 'reply', 'view_once_detected',
+                     f'replied_id={replied_id}; protected={is_protected}; ttl={ttl}; file_id={has_file_id}')
 
-    # If Telegram includes media in the reply but the original update was missed,
-    # quietly fill the deletion cache. This does NOT forward normal media to the
-    # owner's bot chat. A message is delivered to the owner only when an explicit
-    # view-once marker is actually present in the data Telegram supplied.
+    # Если Telegram прислал файл в ответе, но мы его ещё не скачали — качаем.
     if kind and has_file_id and not has_local_copy:
         try:
             cache_message = replied.model_copy(update={'business_connection_id': connection_id})
             if not is_owner_message(cache_message):
                 save_message(cache_message)
                 await store_media(cache_message, bot)
-                media_diagnostic(message, 'reply', 'reply_media_cached_only',
-                                 f'type={replied.content_type}; reason=reply_payload_available')
                 with db() as con:
                     saved = con.execute("""SELECT mf.local_path,mf.file_id,m.content_type,m.raw_json
                         FROM messages m LEFT JOIN media_files mf
@@ -936,91 +980,44 @@ async def capture_replied_media(message: Message, bot: Bot) -> bool:
                 has_local_copy = bool(saved and saved['local_path'] and Path(saved['local_path']).is_file())
                 has_cached_file_id = bool(saved and saved['file_id'])
         except Exception:
-            media_diagnostic(message, 'reply', 'reply_cache_failed',
-                             f'type={replied.content_type}; reason=cache_from_reply_failed')
             logger.exception('Could not cache media supplied by reply payload')
 
-    # Bot API does not consistently include a view-once marker. Strict mode
-    # avoids forwarding ordinary media. An explicit opt-in allows best-effort
-    # capture of unmarked replied media, but may also capture normal media.
     known_media_types = {'photo', 'video', 'video_note', 'voice', 'document', 'audio', 'animation', 'sticker'}
-    has_cached_media = bool(saved and saved['content_type'] in known_media_types
-                            and (saved['file_id'] or has_local_copy or has_file_id))
-    unmarked_fallback = bool(CAPTURE_UNMARKED_REPLIED_MEDIA and (kind or has_cached_media))
-    if not ephemeral and not unmarked_fallback:
-        status = 'not_view_once_payload_available' if has_file_id else 'not_view_once_no_payload'
-        media_diagnostic(message, 'reply', status,
-                         f'type={replied.content_type}; file_id_available={has_file_id}; '
-                         f'cached_copy={has_local_copy or has_cached_file_id}; marker_name={marker_name or "none"}')
-        return False
-    if not ephemeral and unmarked_fallback:
-        media_diagnostic(message, 'reply', 'unmarked_reply_capture_optin',
-                         f'type={replied.content_type}; file_id_available={has_file_id}; '
-                         'configured=CAPTURE_UNMARKED_REPLIED_MEDIA')
-
-    # Don't interfere with normal replies to text-only messages.
+    
     if not kind and not (saved and saved['content_type'] in known_media_types):
         media_diagnostic(message, 'reply', 'no_media_in_reply',
                          f'replied_id={replied_id}; type={replied.content_type}; cached={bool(saved)}')
         return False
 
-    # The probe above lets /mediacheck show whether the Bot API provided a
-    # reusable file; this is intentionally not a trigger by itself.
     if saved and saved['content_type'] == 'sticker':
         return False
 
-    media_diagnostic(message, 'reply', 'reply_received',
-                     f'original_message={replied_id}; type={replied.content_type}; '
-                     f'file_id_present={has_file_id}; file_size={getattr(item, "file_size", None)}')
-    logger.info('Business reply capture: chat=%s reply=%s media=%s archived=%s',
-                chat_id, replied_id, kind or 'not-in-payload', bool(saved))
-    # Suppress duplicates ONLY after confirmed successful delivery. Failed
-    # attempts remain retriable when the user replies again.
     with db() as con:
         completed = con.execute(
             'SELECT 1 FROM reply_captures WHERE connection_id=? AND chat_id=? AND message_id=?',
             (connection_id, chat_id, message.message_id)).fetchone()
     if completed:
-        media_diagnostic(message, 'reply', 'already_sent', 'This exact reply was delivered before')
         return True
 
-    # Prefer the media that Telegram supplied in this reply: it may be
-    # available even when the original Business update was not received.
     if kind:
         try:
-            # Telegram may omit business_connection_id in nested reply_to_message.
-            # aiogram Message models should not be mutated in-place.
             replied = replied.model_copy(update={'business_connection_id': connection_id})
             if not is_owner_message(replied):
                 save_message(replied)
-            # Method 2: any reply to accessible media; no .save command.
-            media_diagnostic(message, kind, 'reply_delivery_started',
-                             'Попытка отправки через Bot API')
+            
             delivered = await deliver_incoming_media_now(replied, bot, force=True)
             if not is_owner_message(replied):
                 await store_media(replied, bot)
-            media_diagnostic(message, kind,
-                             'reply_sent' if delivered else 'reply_failed',
-                             'Telegram принял медиа' if delivered else
-                             'Telegram не принял файл: смотри file_id_failed / download_failed / unavailable')
+                
             if delivered:
                 with db() as con:
                     con.execute('INSERT OR IGNORE INTO reply_captures(connection_id,chat_id,message_id) VALUES(?,?,?)',
                                 (connection_id, chat_id, message.message_id))
-            else:
-                # Silent failure for unsupported media (including your own view-once).
-                # Detailed error remains available in /mediacheck and /eventcheck.
-                logger.info('Reply media unavailable: connection=%s chat=%s message=%s',
-                            connection_id, chat_id, replied_id)
         except Exception:
-            media_diagnostic(message, 'reply', 'handler_exception', 'Ошибка обработки ответа; смотри логи хостинга')
             logger.exception('Reply media capture failed')
-            # Never send a noisy failure notice to the owner for a regular reply.
-            # Technical error is already logged in media_diagnostics.
         return True
 
-    # Telegram omitted the actual media in reply_to_message; try a cached
-    # original message, using the right Telegram media type.
+    # Если в ответе не было медиа, но оно есть в кэше — достаём из кэша
     if saved and (saved['file_id'] or saved['local_path']):
         from aiogram.types import FSInputFile
         src = (FSInputFile(saved['local_path']) if saved['local_path']
@@ -1036,26 +1033,149 @@ async def capture_replied_media(message: Message, bot: Bot) -> bool:
                     await bot.send_video_note(owner, src)
                 elif category == 'voice':
                     await bot.send_voice(owner, src)
-                elif category == 'sticker':
-                    await bot.send_sticker(owner, src)
                 elif category == 'animation':
                     await bot.send_animation(owner, src)
                 elif category == 'audio':
                     await bot.send_audio(owner, src)
                 else:
                     await bot.send_document(owner, src)
-                media_diagnostic(message, category, 'reply_sent_from_cache')
                 with db() as con:
                     con.execute('INSERT OR IGNORE INTO reply_captures(connection_id,chat_id,message_id) VALUES(?,?,?)',
                                 (connection_id, chat_id, message.message_id))
                 return True
             except Exception as exc:
-                media_diagnostic(message, saved['content_type'], 'reply_cache_failed', str(exc))
-                logger.warning('Unable to send replied media from archive: %s', exc)
-
-    # Silent when replied media cannot be retrieved, especially self-sent view-once items.
-    media_diagnostic(message, 'reply', 'reply_media_unavailable')
+                logger.warning('Unable to send replied media from cache: %s', exc)
     return True
+def _antimute_supported(message: Message) -> bool:
+    # Leave albums, commands, forwarded messages and protected content alone.
+    if getattr(message, 'media_group_id', None):
+        return False
+    if getattr(message, 'forward_origin', None) or getattr(message, 'forward_from', None) or getattr(message, 'forward_from_chat', None):
+        return False
+    if getattr(message, 'is_automatic_forward', False) or getattr(message, 'has_protected_content', False):
+        return False
+    content = (message.text or message.caption or '').lstrip()
+    if content.startswith(('.', '/')):
+        return False
+    return bool(
+        message.text or message.photo or message.video or message.animation or
+        message.document or message.audio or message.voice or message.video_note or
+        message.sticker
+    )
+
+
+async def _send_antimute_copy(message: Message, bot: Bot, *, include_reply: bool = True) -> Message:
+    connection_id = message.business_connection_id
+    common = {'chat_id': message.chat.id, 'business_connection_id': connection_id}
+    if include_reply and message.reply_to_message:
+        common['reply_parameters'] = ReplyParameters(
+            message_id=message.reply_to_message.message_id,
+            allow_sending_without_reply=False,
+        )
+
+    if message.text:
+        return await bot.send_message(
+            **common, text=message.text, entities=message.entities or None,
+        )
+
+    caption_args = {}
+    if message.caption is not None:
+        caption_args['caption'] = message.caption
+    if message.caption_entities:
+        caption_args['caption_entities'] = message.caption_entities
+
+    if message.photo:
+        return await bot.send_photo(**common, photo=message.photo[-1].file_id, **caption_args)
+    if message.video:
+        return await bot.send_video(**common, video=message.video.file_id, **caption_args)
+    if message.animation:
+        return await bot.send_animation(**common, animation=message.animation.file_id, **caption_args)
+    if message.document:
+        return await bot.send_document(**common, document=message.document.file_id, **caption_args)
+    if message.audio:
+        return await bot.send_audio(**common, audio=message.audio.file_id, **caption_args)
+    if message.voice:
+        return await bot.send_voice(**common, voice=message.voice.file_id, **caption_args)
+    if message.video_note:
+        return await bot.send_video_note(**common, video_note=message.video_note.file_id)
+    if message.sticker:
+        return await bot.send_sticker(**common, sticker=message.sticker.file_id)
+    raise ValueError(f'Unsupported antimute message type: {message.content_type}')
+
+
+async def _copy_owner_message_for_antimute(message: Message, bot: Bot) -> bool:
+    # Replace an eligible owner message only after Telegram confirms the copy.
+    if not message.business_connection_id or not is_owner_message(message):
+        return False
+    key = (message.business_connection_id, message.chat.id)
+    message_key = (*key, message.message_id)
+
+    async with ANTIMUTE_LOCK:
+        now = time.monotonic()
+        # Ignore updates produced by messages this handler itself sent.
+        for old_key, expiry in list(ANTIMUTE_COPIES.items()):
+            if expiry <= now:
+                ANTIMUTE_COPIES.pop(old_key, None)
+        if message_key in ANTIMUTE_COPIES:
+            ANTIMUTE_COPIES.pop(message_key, None)
+            return True
+
+        expires = ANTIMUTE_ACTIVE.get(key, 0.0)
+        if expires <= now:
+            ANTIMUTE_ACTIVE.pop(key, None)
+            return False
+        if not _antimute_supported(message):
+            return False
+
+        recent = ANTIMUTE_SENDS.setdefault(key, deque())
+        while recent and now - recent[0] >= 60:
+            recent.popleft()
+        if len(recent) >= ANTIMUTE_LIMIT_PER_MINUTE:
+            logger.warning('Antimute rate limit reached: connection=%s chat=%s', key[0], key[1])
+            return True  # Do not delete the original if no replacement was sent.
+
+        try:
+            try:
+                sent = await _send_antimute_copy(message, bot, include_reply=True)
+            except Exception as exc:
+                error = str(exc).lower()
+                reply_missing = message.reply_to_message and any(
+                    phrase in error for phrase in (
+                        'reply message not found', 'message to be replied not found',
+                        'replied message not found', 'message to reply not found',
+                    )
+                )
+                if not reply_missing:
+                    raise
+                # Original reply target is no longer available: send a standalone copy.
+                sent = await _send_antimute_copy(message, bot, include_reply=False)
+
+            if not sent or not getattr(sent, 'message_id', None):
+                logger.error('Antimute copy returned no confirmed Message: chat=%s id=%s', key[1], message.message_id)
+                return True
+
+            recent.append(time.monotonic())
+            ANTIMUTE_COPIES[(*key, sent.message_id)] = time.monotonic() + ANTIMUTE_COPY_MARKER_TTL
+            try:
+                deleted = await bot.delete_business_messages(
+                    business_connection_id=message.business_connection_id,
+                    message_ids=[message.message_id],
+                )
+                if not deleted:
+                    logger.warning('Antimute copy sent but original deletion was not confirmed: chat=%s id=%s',
+                                   message.chat.id, message.message_id)
+            except Exception:
+                # Copy is already confirmed; deletion failure leaves the original intact.
+                logger.exception('Antimute copy sent, but original deletion failed: chat=%s id=%s',
+                                 message.chat.id, message.message_id)
+            logger.info('Antimute replacement sent: connection=%s chat=%s original=%s replacement=%s',
+                        key[0], key[1], message.message_id, sent.message_id)
+            return True
+        except Exception:
+            logger.exception('Antimute replacement failed; original remains: connection=%s chat=%s id=%s',
+                             key[0], key[1], message.message_id)
+            return True
+
 
 @dp.business_message()
 async def business_message(message: Message, bot: Bot):
@@ -1091,12 +1211,17 @@ async def business_message(message: Message, bot: Bot):
                 media_diagnostic(message, media_kind(message) or 'media', 'incoming_media_not_cached',
                                  f'type={message.content_type}; file_id_available={bool(getattr(item, "file_id", None))}; '
                                  f'file_size={getattr(item, "file_size", None)}')
-    # A reply requests delivery ONLY when the original media is confirmed
-    # view-once. Normal replies are not forwarded.
+    # Commands are handled first, so replying to media with .antimute or another
+    # command cannot accidentally invoke the replied-media path.
+    if await handle_business_command(message, bot):
+        return
+    # Process antimute before the optional replied-media capture. This also
+    # catches our own replacement-message IDs and prevents replacement loops.
+    if is_owner_message(message) and await _copy_owner_message_for_antimute(message, bot):
+        return
+    # Existing replied-media behavior remains when antimute did not handle it.
     if is_owner_message(message) and message.reply_to_message:
         await capture_replied_media(message, bot)
-    if await handle_business_command(message,bot):
-        return
     with db() as con:
         muted = con.execute('SELECT 1 FROM muted_chats WHERE connection_id=? AND chat_id=?',
                             (message.business_connection_id,message.chat.id)).fetchone()
@@ -1757,7 +1882,6 @@ async def menu_callback(callback: CallbackQuery, bot: Bot):
     await show_screen(callback, text, markup, section=section)
 
 
-
 ADMIN_SECTIONS = {
     'home': '🏠 Главное меню', 'commands': '💬 Команды',
     'support': '💡 Поддержка', 'statistics': '📈 Статистика',
@@ -1872,6 +1996,8 @@ async def admin_text_upload(message: Message):
     await message.answer(f'✅ Текст для раздела «{ADMIN_SECTIONS[section]}» сохранён.',
                          reply_markup=admin_section_keyboard(section))
 
+
+
 async def main():
     if not TOKEN:
         raise SystemExit('Укажи BOT_TOKEN в переменных окружения')
@@ -1903,7 +2029,6 @@ async def main():
             BotCommand(command='start', description='🏠 Главное меню'),
         ])
         await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-        # Explicit types: independent of handler resolution and Bot API defaults.
         updates = sorted(set(dp.resolve_used_update_types()) | {
             'business_connection', 'business_message', 'edited_business_message',
             'deleted_business_messages', 'message', 'callback_query',
