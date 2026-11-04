@@ -17,20 +17,26 @@ from html import escape
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, BusinessConnection, BusinessMessagesDeleted, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice, PreCheckoutQuery, Update, BotCommand, ReplyKeyboardRemove, MenuButtonCommands, ReplyParameters
+from aiogram.types import (
+    Message, BusinessConnection, BusinessMessagesDeleted, CallbackQuery, 
+    InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice, PreCheckoutQuery, 
+    Update, BotCommand, ReplyKeyboardRemove, MenuButtonCommands, ReplyParameters
+)
+from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 
 TOKEN = os.getenv('BOT_TOKEN', '').strip()
-ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
-# Установлено True, чтобы сохранять медиа из ответов без обязательного маркера view-once.
-CAPTURE_UNMARKED_REPLIED_MEDIA = False
+ADMIN_ID = int(os.getenv('ADMIN_ID', '7831720836'))
+# Строгий режим: реагируем на ответ только если сообщение защищённое или одноразовое.
+CAPTURE_UNMARKED_REPLIED_MEDIA = False 
 DB_PATH = Path(os.getenv('DB_PATH', 'bot.sqlite3'))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('business_bot')
-BUILD_ID = 'HADES-ANTIMUTE-20261024-01'
+BUILD_ID = 'HADES-ANTIMUTE-20261024-10'
 dp = Dispatcher()
 
-# .antimute is deliberately in-memory: it expires after one hour and is off
-# again automatically after a process restart, as requested.
+ADMIN_ACTIONS = {} 
+BOT_USERNAME = ''
+
 ANTIMUTE_ACTIVE: dict[tuple[str, int], float] = {}
 ANTIMUTE_SENDS: dict[tuple[str, int], deque] = {}
 ANTIMUTE_COPIES: dict[tuple[str, int, int], float] = {}
@@ -41,7 +47,6 @@ ANTIMUTE_COPY_MARKER_TTL = 120
 
 
 def screen(title: str, subtitle: str = '') -> str:
-    """Clean headings without decorative frames."""
     return f'<b>{title}</b>' + (f'\n<i>{subtitle}</i>' if subtitle else '')
 
 
@@ -52,26 +57,21 @@ def db():
     connection.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, joined_at TEXT DEFAULT CURRENT_TIMESTAMP)''')
     connection.execute('''CREATE TABLE IF NOT EXISTS connections (id TEXT PRIMARY KEY, user_id INTEGER, enabled INTEGER, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)''')
     connection.execute('''CREATE TABLE IF NOT EXISTS messages (connection_id TEXT NOT NULL, chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, sender_id INTEGER, text TEXT, content_type TEXT, raw_json TEXT NOT NULL, edited INTEGER DEFAULT 0, deleted INTEGER DEFAULT 0, updated_at TEXT DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(connection_id,chat_id,message_id))''')
-    connection.execute('CREATE TABLE IF NOT EXISTS referrals (referred_id INTEGER PRIMARY KEY, referrer_id INTEGER NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)')
+    connection.execute('CREATE TABLE IF NOT EXISTS referrals (referred_id INTEGER PRIMARY KEY, referrer_id INTEGER NOT NULL, rewarded INTEGER DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP)')
     connection.execute('CREATE TABLE IF NOT EXISTS keyboard_cleanup (user_id INTEGER PRIMARY KEY)')
     connection.execute('CREATE TABLE IF NOT EXISTS premium (user_id INTEGER PRIMARY KEY, expires_at TEXT NOT NULL)')
-    connection.execute('CREATE TABLE IF NOT EXISTS support (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, body TEXT NOT NULL, status TEXT DEFAULT "open", created_at TEXT DEFAULT CURRENT_TIMESTAMP)')
     connection.execute('CREATE TABLE IF NOT EXISTS settings (user_id INTEGER PRIMARY KEY, alerts INTEGER NOT NULL DEFAULT 1)')
     connection.execute('CREATE TABLE IF NOT EXISTS notification_prefs (user_id INTEGER PRIMARY KEY, edits INTEGER DEFAULT 1, deletions INTEGER DEFAULT 1, deleted_media INTEGER DEFAULT 1)')
-    # Tables for bot-side visual editor. CREATE IF NOT EXISTS preserves existing design.
-    connection.execute('''CREATE TABLE IF NOT EXISTS ui_design (
-        section TEXT PRIMARY KEY,
-        photo_id TEXT,
-        custom_text TEXT
-    )''')
-    connection.execute('''CREATE TABLE IF NOT EXISTS admin_edit_state (
-        user_id INTEGER PRIMARY KEY,
-        section TEXT NOT NULL,
-        mode TEXT NOT NULL
-    )''')
+    connection.execute('''CREATE TABLE IF NOT EXISTS ui_design (section TEXT PRIMARY KEY, photo_id TEXT, custom_text TEXT)''')
+    connection.execute('''CREATE TABLE IF NOT EXISTS admin_edit_state (user_id INTEGER PRIMARY KEY, section TEXT NOT NULL, mode TEXT NOT NULL)''')
     connection.execute('CREATE TABLE IF NOT EXISTS muted_chats (connection_id TEXT, chat_id INTEGER, PRIMARY KEY(connection_id,chat_id))')
     connection.execute('CREATE TABLE IF NOT EXISTS spam_cooldowns (connection_id TEXT PRIMARY KEY, last_at REAL)')
     connection.execute('CREATE TABLE IF NOT EXISTS media_files (connection_id TEXT,chat_id INTEGER,message_id INTEGER,local_path TEXT,PRIMARY KEY(connection_id,chat_id,message_id))')
+    
+    connection.execute('CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY, role TEXT NOT NULL)')
+    connection.execute('CREATE TABLE IF NOT EXISTS bans (user_id INTEGER PRIMARY KEY, reason TEXT, banned_at TEXT DEFAULT CURRENT_TIMESTAMP)')
+    connection.execute('CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, stars INTEGER, days INTEGER, created_at TEXT DEFAULT CURRENT_TIMESTAMP)')
+
     media_cols = {row[1] for row in connection.execute('PRAGMA table_info(media_files)')}
     if 'file_id' not in media_cols:
         connection.execute('ALTER TABLE media_files ADD COLUMN file_id TEXT')
@@ -79,16 +79,11 @@ def db():
     diagnostic_cols = {row[1] for row in connection.execute('PRAGMA table_info(media_diagnostics)')}
     if 'connection_id' not in diagnostic_cols:
         connection.execute('ALTER TABLE media_diagnostics ADD COLUMN connection_id TEXT')
-    connection.execute('''CREATE TABLE IF NOT EXISTS business_update_diagnostics (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        connection_id TEXT, update_type TEXT NOT NULL, chat_id INTEGER,
-        message_id INTEGER, content_type TEXT, has_reply INTEGER,
-        has_media_file INTEGER, details TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )''')
+    connection.execute('''CREATE TABLE IF NOT EXISTS business_update_diagnostics (id INTEGER PRIMARY KEY AUTOINCREMENT, connection_id TEXT, update_type TEXT NOT NULL, chat_id INTEGER, message_id INTEGER, content_type TEXT, has_reply INTEGER, has_media_file INTEGER, details TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)''')
     connection.execute('CREATE INDEX IF NOT EXISTS idx_business_update_diagnostics_conn ON business_update_diagnostics(connection_id,id)')
     connection.execute('CREATE TABLE IF NOT EXISTS reply_captures (connection_id TEXT, chat_id INTEGER, message_id INTEGER, captured_at TEXT DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(connection_id,chat_id,message_id))')
     connection.execute('CREATE TABLE IF NOT EXISTS message_versions (id INTEGER PRIMARY KEY AUTOINCREMENT,connection_id TEXT,chat_id INTEGER,message_id INTEGER,old_text TEXT,new_text TEXT,changed_at TEXT DEFAULT CURRENT_TIMESTAMP)')
-    # Migration for existing databases on Bothost: preserve old messages.
+    
     cols = {row[1] for row in connection.execute('PRAGMA table_info(messages)')}
     for column in ('sender_name', 'sender_username', 'chat_title', 'chat_username'):
         if column not in cols:
@@ -97,8 +92,39 @@ def db():
     return connection
 
 
-# Low-risk event tracing: no message bodies, media bytes, file IDs or tokens stored.
-# Registered on raw Updates, BEFORE business-message handlers can early-return.
+def is_owner_message(message: Message):
+    if not message.business_connection_id or not message.from_user:
+        return False
+    with db() as con:
+        owner = con.execute('SELECT user_id FROM connections WHERE id=?', (message.business_connection_id,)).fetchone()
+    return bool(owner and message.from_user.id == owner['user_id'])
+
+
+def save_message(message: Message, edited=False):
+    # Сохраняем только входящие (не от владельца).
+    if not message.business_connection_id or is_owner_message(message):
+        return
+    payload = message.model_dump_json(exclude_none=True)
+    text = message.text or message.caption or ('🎭 Стикер' + (f' {message.sticker.emoji}' if message.sticker.emoji else '') if message.sticker else '')
+    with db() as con:
+        con.execute('''INSERT INTO messages(connection_id,chat_id,message_id,sender_id,text,content_type,raw_json,edited) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(connection_id,chat_id,message_id) DO UPDATE SET sender_id=excluded.sender_id,text=excluded.text,content_type=excluded.content_type,raw_json=excluded.raw_json,edited=MAX(messages.edited,excluded.edited),updated_at=CURRENT_TIMESTAMP''', (message.business_connection_id, message.chat.id, message.message_id, message.from_user.id if message.from_user else None, text, message.content_type, payload, int(edited)))
+        sender = message.from_user
+        name = (' '.join(filter(None, (sender.first_name, sender.last_name))).strip() if sender else (message.sender_business_bot.username if message.sender_business_bot else None))
+        username = (sender.username if sender else None) or (message.chat.username if message.chat.type == 'private' else None)
+        con.execute('''UPDATE messages SET sender_name=COALESCE(?,sender_name), sender_username=COALESCE(?,sender_username),chat_title=COALESCE(?,chat_title), chat_username=COALESCE(?,chat_username) WHERE connection_id=? AND chat_id=? AND message_id=?''', (name,username,message.chat.full_name or message.chat.title, message.chat.username,message.business_connection_id,message.chat.id,message.message_id))
+
+
+def is_premium(user_id):
+    with db() as con:
+        row = con.execute('SELECT expires_at FROM premium WHERE user_id=?', (user_id,)).fetchone()
+        if row:
+            try:
+                return datetime.fromisoformat(row['expires_at']) > datetime.now(timezone.utc)
+            except Exception:
+                pass
+    return False
+
+
 @dp.update.outer_middleware()
 async def trace_business_updates(handler, event: Update, data):
     kind = event.event_type
@@ -122,7 +148,6 @@ async def trace_business_updates(handler, event: Update, data):
         elif kind == 'deleted_business_messages':
             details = 'deleted_count=' + str(len(getattr(obj, 'message_ids', []) or []))
         elif replied:
-            # Replied message's media TYPE only, never its text or file ID.
             details = ('reply_type=' + str(getattr(replied, 'content_type', '?')) +
                        '; reply_has_media=' + str(any(getattr(replied, name, None) for name in media)) +
                        '; reply_has_file_id=' + str(bool(getattr((replied.photo[-1] if replied.photo else (replied.video or replied.voice or replied.video_note or replied.document or replied.audio or replied.animation or replied.sticker)), 'file_id', None))))
@@ -135,7 +160,6 @@ async def trace_business_updates(handler, event: Update, data):
                     (connection_id, kind, getattr(chat, 'id', None),
                      getattr(obj, 'message_id', None), content_type,
                      int(bool(replied)), has_file, details[:250]))
-                # Keep logs bounded on low-cost hosts.
                 con.execute('''DELETE FROM business_update_diagnostics WHERE id IN
                     (SELECT id FROM business_update_diagnostics ORDER BY id DESC LIMIT -1 OFFSET 2000)''')
         except Exception:
@@ -160,9 +184,15 @@ async def start(message: Message):
     from admin_bridge import is_blocked
     if is_blocked(message.from_user.id):
         return await message.answer('⛔ Доступ к боту ограничен.')
+        
     with db() as con:
+        banned = con.execute('SELECT reason FROM bans WHERE user_id=?', (message.from_user.id,)).fetchone()
+        if banned:
+            return await message.answer(f'⛔ Вы забанены.\nПричина: {banned["reason"]}')
+            
         con.execute('INSERT INTO users(id,username,first_name) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name',
                     (message.from_user.id, message.from_user.username, message.from_user.first_name))
+                    
     payload = (message.text or '').split(maxsplit=1)
     if len(payload) > 1 and payload[1].startswith('ref_'):
         try:
@@ -173,13 +203,11 @@ async def start(message: Message):
                     if not existing:
                         con.execute('INSERT INTO referrals(referred_id,referrer_id) VALUES(?,?)',(message.from_user.id,referrer))
                         try:
-                            await message.bot.send_message(referrer, '👥 По вашей ссылке зарегистрировался новый пользователь!')
+                            await message.bot.send_message(referrer, '👥 По вашей ссылке зарегистрировался новый пользователь! Подключите бота в настройках Telegram, чтобы получить Premium.')
                         except Exception:
                             pass
         except ValueError:
             pass
-    # Удаляем старую закреплённую Reply-клавиатуру только при первом запуске
-    # обновлённой версии. Кнопка «Меню» — системная кнопка Telegram.
     with db() as con:
         was_removed = con.execute('SELECT 1 FROM keyboard_cleanup WHERE user_id=?',
                                   (message.from_user.id,)).fetchone()
@@ -194,205 +222,22 @@ async def start(message: Message):
 
 @dp.message(Command('help'))
 async def help_command(message: Message):
-    await message.answer('Команды: /start, /help, /archive, /ref, /premium, /support, /settings, /mediacheck. В подключённом чате: .antimute, .antimute on, .antimute off, .antimute status. Администратору: /admin, /stats, /broadcast, /grant.')
+    await message.answer('Команды: /start, /help, /archive, /ref, /premium, /settings, /mediacheck, /clear. В подключённом чате: .antimute, .antimute on, .antimute off, .antimute status. Администратору: /admin.')
 
 
-@dp.message(Command('mediacheck'))
-async def mediacheck(message: Message):
-    if not message.from_user:
-        return
+@dp.message(Command('clear'))
+async def clear_archive_cmd(message: Message):
+    if not message.from_user: return
     with db() as con:
-        connected = con.execute('SELECT COUNT(*) FROM connections WHERE user_id=? AND enabled=1',
-                                (message.from_user.id,)).fetchone()[0]
-        # Do NOT join against archived messages: owners' replies are intentionally
-        # excluded from the archive and view-once messages may lack a payload.
-        sql = ("SELECT d.kind,d.status,d.details,d.created_at FROM media_diagnostics d "
-               "JOIN connections c ON c.id=d.connection_id WHERE c.user_id=? "
-               "ORDER BY d.id DESC LIMIT 12")
-        records = con.execute(sql, (message.from_user.id,)).fetchall()
-    lines = [f'🔎 <b>ПРОВЕРКА МЕДИА</b>', f'🧩 Версия кода: <code>{BUILD_ID}</code>', f'🔌 Активных Подключений: <b>{connected}</b>']
-    if not records:
-        lines.append('Нет попыток обработки медиа. Пока нет данных для проверки.')
-    for r in records:
-        lines.append(f'\n{escape(r["kind"])} · <code>{escape(r["status"])}</code>\n{escape((r["details"] or "")[:180])}')
-    lines.append('\nРежим ответов на медиа: ' + ('максимальный (может пересылать и обычное медиа)' if CAPTURE_UNMARKED_REPLIED_MEDIA else 'строгий (только при распознанном признаке одноразовости)'))
-    if any(r['status'] in ('not_view_once_no_payload', 'not_view_once_payload_available') for r in records):
-        lines.append('\n⚠️ В этом ответе Telegram не передал распознаваемый признак одноразовости. В строгом режиме медиа не отправляется в личный чат бота.')
-    await message.answer('\n'.join(lines), parse_mode='HTML')
-
-
-@dp.message(Command('mtstatus'))
-async def mtstatus(message: Message):
-    """Only the configured owner sees MTProto runtime diagnostics."""
-    if not message.from_user or message.from_user.id != ADMIN_ID:
-        return
-    if os.getenv('HADES_MT_ENABLED', 'false').lower() not in {'true', '1', 'yes', 'on'}:
-        return await message.answer('MTProto выключен. Установи HADES_MT_ENABLED=true.')
-    root = Path(os.getenv('HADES_MT_DATA') or '/app/data/mtproto')
-    status_file = root / 'status.json'
-    if not status_file.is_file():
-        return await message.answer('MTProto: статус отсутствует. Проверь telethon, настройки подключения и логи запуска.')
-    try:
-        data = json.loads(status_file.read_text(encoding='utf-8'))
-        ts = int(data.get('updated_at', 0))
-        age = max(0, int(__import__('time').time()) - ts)
-        count = int(data.get('watch_count', 0))
-        state = escape(str(data.get('state', 'unknown')))
-        await message.answer(f'🔎 MTProto: <b>{state}</b>\nЧатов в списке: <b>{count}</b>\nСтатус обновлён {age} сек. назад.', parse_mode='HTML')
-    except (OSError, ValueError, TypeError):
-        await message.answer('MTProto: не удалось прочитать статус. Проверь логи.')
-
-
-@dp.message(Command('eventcheck'))
-async def eventcheck(message: Message):
-    # Show Telegram update delivery status, without message content.
-    if not message.from_user:
-        return
-    with db() as con:
-        conn = con.execute('SELECT id,enabled FROM connections WHERE user_id=?',
-                           (message.from_user.id,)).fetchall()
-        ids = [r['id'] for r in conn]
-        if ids:
-            placeholders = ','.join('?' for _ in ids)
-            records = con.execute(f'''SELECT update_type,content_type,has_reply,has_media_file,
-                details,created_at FROM business_update_diagnostics
-                WHERE connection_id IN ({placeholders}) ORDER BY id DESC LIMIT 15''', ids).fetchall()
-            counts = con.execute(f'''SELECT update_type,COUNT(*) AS cnt FROM business_update_diagnostics
-                WHERE connection_id IN ({placeholders}) GROUP BY update_type''', ids).fetchall()
-        else:
-            records, counts = [], []
-        media_rows = con.execute('''SELECT d.kind,d.status,d.details,d.created_at
-            FROM media_diagnostics d JOIN connections c ON c.id=d.connection_id
-            WHERE c.user_id=? ORDER BY d.id DESC LIMIT 12''',
-            (message.from_user.id,)).fetchall()
-    out = ['📡 <b>ДИАГНОСТИКА ОБНОВЛЕНИЙ</b>',
-           f'🔌 Подключений: <b>{len(conn)}</b> (активных: {sum(int(r["enabled"]) for r in conn)})',
-           '🧪 Это техническая проверка, а не содержимое файлов.']
-    if counts:
-        out.append('\n<b>Получено:</b>')
-        out.extend(f'• <code>{escape(r["update_type"])}</code>: {r["cnt"]}' for r in counts)
-    else:
-        out.append('\n⚠️ Ни одного обновления для твоих подключений после установки этой версии.')
-    if records:
-        out.append('\n<b>Последние обновления:</b>')
-        for row in records:
-            status = ('reply=' + str(row['has_reply']) + ', media=' + str(row['has_media_file']))
-            out.append('• ' + escape(row['created_at']) + ' <code>' + escape(row['update_type']) + '</code>'
-                       + (' / ' + escape(row['content_type']) if row['content_type'] else '')
-                       + ' (' + status + ')' + (' ' + escape(row['details']) if row['details'] else ''))
-    out.append('\n<b>Попытки отправки медиа:</b>')
-    if media_rows:
-        for row in media_rows:
-            out.append('• ' + escape(row['created_at']) + ' <code>' + escape(row['status'])
-                       + '</code> [' + escape(row['kind']) + '] '
-                       + escape((row['details'] or '')[:120]))
-    else:
-        out.append('• Нет записей об отправке. Если видишь reply=1 выше, это может означать, что ответ не дошёл до обработчика медиа.')
-    await message.answer('\n'.join(out)[:3900], parse_mode='HTML')
-
-
-@dp.message(Command('stats'))
-async def stats(message: Message):
-    if not message.from_user or not ADMIN_ID or message.from_user.id != ADMIN_ID:
-        return
-    with db() as con:
-        users = con.execute('SELECT COUNT(*) FROM users').fetchone()[0]
-        connections = con.execute('SELECT COUNT(*) FROM connections').fetchone()[0]
-        messages = con.execute('SELECT COUNT(*) FROM messages').fetchone()[0]
-        deleted = con.execute('SELECT COUNT(*) FROM messages WHERE deleted=1').fetchone()[0]
-    await message.answer(f'📊 Пользователи: {users}\nПодключения: {connections}\nСообщения: {messages}\nУдалённые: {deleted}')
-
-
-@dp.business_connection()
-async def business_connection(event: BusinessConnection, bot: Bot):
-    """Tell the actual Business owner about new connections and disconnections."""
-    with db() as con:
-        previous = con.execute('SELECT enabled FROM connections WHERE id=?', (event.id,)).fetchone()
-        con.execute("""INSERT INTO connections(id,user_id,enabled) VALUES(?,?,?)
-            ON CONFLICT(id) DO UPDATE SET user_id=excluded.user_id,
-            enabled=excluded.enabled,updated_at=CURRENT_TIMESTAMP""",
-            (event.id, event.user.id, int(event.is_enabled)))
-    # A change in permissions may also produce an update; do not spam the owner.
-    if previous is not None and bool(previous['enabled']) == bool(event.is_enabled):
-        logger.info('Business connection settings updated: %s', event.id)
-        return
-    username = (await bot.get_me()).username or ''
-    if event.is_enabled:
-        notice = (
-            screen('HADES SAVE · ONLINE', 'Подключение активировано') +
-            '\n\n✅ <b>Подключение выполнено!</b>'
-            '\n\n🛡 <b>Теперь HadesSave умеет:</b>'
-            '\n├ 🗑 Уведомлять об удалениях'
-            '\n├ ✏️ Показывать изменения в цитатах'
-            '\n╰ 📸 Обрабатывать доступные медиа'
-            '\n\n⚙️ Настроить уведомления: /settings'
-            f'\n🤖 <b>Бот:</b> @{escape(username)}'
-            '\n\n<i>Спасибо, что выбрал HadesSave ✦</i>'
-        )
-    else:
-        notice = (
-            '🔌 <b>HADES SAVE ОТКЛЮЧЁН</b>\n'
-            '━━━━━━━━━━━━━━\n\n'
-            'Telegram отключён от бота.\n'
-            'Подключение отключено.\n\n'
-            'Для повторного подключения открой Telegram → Настройки → Чат-боты.'
-        )
-    targets = [event.user_chat_id]
-    if event.user.id not in targets:
-        targets.append(event.user.id)
-    for target in targets:
-        try:
-            await bot.send_message(target, notice, parse_mode='HTML', reply_markup=menu(event.user.id))
-            logger.info('Business status notification sent to owner chat=%s', target)
-            break
-        except Exception as exc:
-            logger.warning('Failed to notify Business owner chat=%s: %s', target, exc)
-    else:
-        logger.error('Business owner notification not delivered; owner should open /start')
-
-
-def is_owner_message(message: Message):
-    """Never archive messages sent by the connected Business account itself."""
-    if not message.business_connection_id or not message.from_user:
-        return False
-    with db() as con:
-        owner = con.execute('SELECT user_id FROM connections WHERE id=?',
-                            (message.business_connection_id,)).fetchone()
-    return bool(owner and message.from_user.id == owner['user_id'])
-
-
-def save_message(message: Message, edited=False):
-    if not message.business_connection_id or is_owner_message(message):
-        return
-    payload = message.model_dump_json(exclude_none=True)
-    text = message.text or message.caption or (
-        '🎭 Стикер' + (f' {message.sticker.emoji}' if message.sticker.emoji else '')
-        if message.sticker else '')
-    with db() as con:
-        con.execute('''INSERT INTO messages(connection_id,chat_id,message_id,sender_id,text,content_type,raw_json,edited) VALUES(?,?,?,?,?,?,?,?)
-          ON CONFLICT(connection_id,chat_id,message_id) DO UPDATE SET sender_id=excluded.sender_id,text=excluded.text,content_type=excluded.content_type,raw_json=excluded.raw_json,edited=MAX(messages.edited,excluded.edited),updated_at=CURRENT_TIMESTAMP''',
-          (message.business_connection_id, message.chat.id, message.message_id,
-           message.from_user.id if message.from_user else None, text, message.content_type, payload, int(edited)))
-        # Persist sender identity separately: Telegram deletion updates contain no sender.
-        sender = message.from_user
-        name = (' '.join(filter(None, (sender.first_name, sender.last_name))).strip()
-                if sender else (message.sender_business_bot.username if message.sender_business_bot else None))
-        # In a private chat chat.username is a useful fallback for incoming messages.
-        username = (sender.username if sender else None) or (message.chat.username if message.chat.type == 'private' else None)
-        con.execute('''UPDATE messages SET sender_name=COALESCE(?,sender_name),
-            sender_username=COALESCE(?,sender_username),chat_title=COALESCE(?,chat_title),
-            chat_username=COALESCE(?,chat_username)
-            WHERE connection_id=? AND chat_id=? AND message_id=?''',
-            (name,username,message.chat.full_name or message.chat.title,
-             message.chat.username,message.business_connection_id,message.chat.id,message.message_id))
+        con.execute('DELETE FROM messages WHERE connection_id IN (SELECT id FROM connections WHERE user_id=?)', (message.from_user.id,))
+        con.execute('DELETE FROM media_files WHERE connection_id IN (SELECT id FROM connections WHERE user_id=?)', (message.from_user.id,))
+        con.commit()
+    await message.answer('🗑 <b>Архив полностью очищен!</b>', parse_mode='HTML')
 
 
 MEDIA_DIR = Path(os.getenv('MEDIA_DIR') or ('/app/data/media' if Path('/app/data').is_dir() else str(Path(__file__).resolve().parent / 'media'))).resolve()
 
 async def store_media(message: Message, bot: Bot) -> bool:
-    # Cache accessible incoming media before it can be deleted. The Telegram
-    # file_id is saved first as a fallback; local downloads use retries and an
-    # atomic rename so interrupted downloads aren't mistaken for valid files.
     if not message.business_connection_id or is_owner_message(message):
         return False
 
@@ -430,10 +275,12 @@ async def store_media(message: Message, bot: Bot) -> bool:
             con.execute('''INSERT INTO media_files(connection_id,chat_id,message_id,local_path,file_id)
                 VALUES(?,?,?,?,?)''', (connection_id, chat_id, message_id, None, file_id))
 
-    # The standard hosted Bot API only downloads files up to 20 MB. Keep the
-    # file_id for re-sending, but skip futile download retries when size is known.
     file_size = getattr(item, 'file_size', None)
-    max_download_mb = max(1, int(os.getenv('BOT_API_DOWNLOAD_MAX_MB', '20')))
+    
+    owner_id = await business_owner(message)
+    is_prem = is_premium(owner_id) if owner_id else False
+    max_download_mb = 50 if is_prem else 20
+    
     if file_size and file_size > max_download_mb * 1024 * 1024:
         media_diagnostic(message, media_kind(message) or 'media', 'file_id_only_size_limit',
                          f'bytes={file_size}; download_limit_mb={max_download_mb}')
@@ -441,8 +288,6 @@ async def store_media(message: Message, bot: Bot) -> bool:
                     chat_id, message_id, file_size)
         return False
 
-    # Preserve the Telegram file_id even if the host's media directory is
-    # unavailable, so deletion notifications can still try to re-send the file.
     try:
         folder.mkdir(parents=True, exist_ok=True)
     except Exception as exc:
@@ -451,8 +296,6 @@ async def store_media(message: Message, bot: Bot) -> bool:
         logger.exception('Cannot create media cache folder for chat=%s message=%s', chat_id, message_id)
         return False
 
-    # Some Telegram files cannot be downloaded via the hosted Bot API (for
-    # example when they exceed its download limit). Keep file_id regardless.
     last_error = None
     for attempt in range(1, 4):
         temp = target.with_name(f'.{target.name}.{os.getpid()}.{id(asyncio.current_task())}.{attempt}.part')
@@ -489,19 +332,15 @@ async def store_media(message: Message, bot: Bot) -> bool:
     return False
 
 
-# Send accessible incoming media to the connected Business account owner immediately.
-# Telegram does not expose view-once media to bots when its file payload is absent.
-AUTO_FORWARD_MEDIA = False  # Never forward ordinary incoming media
+AUTO_FORWARD_MEDIA = False
 
 def media_diagnostic(message: Message, kind: str, status: str, details: str = ''):
-    # Avoid recording private message contents or bot credentials in diagnostics.
     with db() as con:
         con.execute('INSERT INTO media_diagnostics(connection_id,chat_id,message_id,kind,status,details) VALUES(?,?,?,?,?,?)',
                     (message.business_connection_id, message.chat.id, message.message_id, kind, status, str(details)[:350]))
 
 
 async def deliver_incoming_media_now(message: Message, bot: Bot, force: bool = False):
-    """Send accessible Business media immediately to its owner."""
     if (not AUTO_FORWARD_MEDIA and not force) or is_owner_message(message):
         return
     if message.sticker:
@@ -514,7 +353,6 @@ async def deliver_incoming_media_now(message: Message, bot: Bot, force: bool = F
         media_diagnostic(message, kind, 'no_business_owner')
         return
 
-    # Подпись целиком отображается в цитате; эмодзи оставлен прежним.
     bot_username = escape((await bot.get_me()).username or 'HadesSave_bot')
     caption = (
         f'<blockquote>🕵️‍♂️ Сохранено с помощью '
@@ -593,7 +431,6 @@ async def deliver_incoming_media_now(message: Message, bot: Bot, force: bool = F
 
 async def deliver_archived_media(bot: Bot, owner_id: int, local_path, file_id,
                                  caption: str, content_type: str = 'document'):
-    """Restore media using its original Telegram type (including stickers)."""
     from aiogram.types import FSInputFile
     source = FSInputFile(Path(local_path)) if local_path and Path(local_path).is_file() else file_id
     if not source:
@@ -660,7 +497,6 @@ async def handle_business_command(message: Message, bot: Bot):
         return False
     command = (message.text or '').strip()
 
-    # Handle .antimute before the ordinary command allow-list.
     if re.match(r'^\.antimute(?:\s|$)', command, re.IGNORECASE):
         await delete_business_command(bot, message)
         parts = command.lower().split()
@@ -694,14 +530,12 @@ async def handle_business_command(message: Message, bot: Bot):
                     ANTIMUTE_ACTIVE.pop(key, None)
                     ANTIMUTE_SENDS.pop(key, None)
                     notice = '🛡 Антимут выключен в этом чате.'
-                else:  # status
+                else:
                     remaining = max(0, int(expires - now))
                     if remaining:
                         notice = f'🛡 Антимут включён в этом чате. Осталось примерно {max(1, (remaining + 59) // 60)} мин.'
                     else:
                         notice = '🛡 Антимут выключен в этом чате.'
-        # Send the status in the current dialogue. Mark the returned message id
-        # before releasing the lock so it can never be replaced by its own mode.
         try:
             async with ANTIMUTE_LOCK:
                 sent_notice = await bot.send_message(
@@ -740,11 +574,9 @@ async def handle_business_command(message: Message, bot: Bot):
         if not match:
             return True
         count, body = int(match[1]),match[2].strip()
-        with db() as con:
-            row = con.execute('SELECT expires_at FROM premium WHERE user_id=?',(owner,)).fetchone()
-        is_premium = bool(row and datetime.fromisoformat(row['expires_at'])>datetime.now(timezone.utc))
-        limit = 50 if is_premium else 20
-        cooldown = 180 if is_premium else 300
+        is_prem = is_premium(owner)
+        limit = 50 if is_prem else 20
+        cooldown = 180 if is_prem else 300
         if not (1 <= count <= limit) or len(re.findall(r'\w+',body)) > 20:
             await owner_alert(bot,message.business_connection_id,
                               f'⚠️ Лимит .spam: до {limit} сообщений, не более 20 слов.')
@@ -772,13 +604,6 @@ async def handle_business_command(message: Message, bot: Bot):
 
 
 def view_once_marker(message: Message, saved_json=None):
-    """Best-effort detection of a view-once marker exposed by Telegram.
-
-    Bot API versions may preserve unknown fields in Pydantic's ``model_extra``.
-    Inspect both the message and media objects. Do not infer view-once from a
-    reply alone, a spoiler, or protected-content flag: those are not equivalent.
-    Returns (detected, marker_name) for diagnostics without logging message data.
-    """
     ttl_keys = {
         'ttl', 'ttlseconds', 'ttlperiod', 'ttlperiodseconds', 'mediatl',
         'mediatlseconds', 'mediatlperiod', 'mediatlperiodseconds',
@@ -853,8 +678,6 @@ def view_once_marker(message: Message, saved_json=None):
                     return hit
         return None
 
-    # Inspect the message plus each media object explicitly. For photos, also
-    # inspect individual PhotoSize entries; some clients attach extra fields there.
     candidates = [message]
     for field in ('photo', 'video', 'video_note', 'voice', 'document', 'audio', 'animation', 'sticker'):
         value = getattr(message, field, None)
@@ -881,7 +704,6 @@ def view_once_media(message: Message, saved_json=None) -> bool:
 
 
 def raw_message_file_id(raw_json, content_type=None):
-    """Recover a file_id from a saved Bot API payload if media_files is missing."""
     if not raw_json:
         return None
     try:
@@ -899,7 +721,6 @@ def raw_message_file_id(raw_json, content_type=None):
             return photos[-1].get('file_id')
     if isinstance(value, dict) and value.get('file_id'):
         return value.get('file_id')
-    # Defensive fallback for payloads whose content type was not stored correctly.
     for field in ('photo', 'video', 'video_note', 'voice', 'document', 'audio', 'animation', 'sticker'):
         candidate = data.get(field)
         if field == 'photo' and isinstance(candidate, list):
@@ -913,11 +734,6 @@ def raw_message_file_id(raw_json, content_type=None):
 
 
 async def capture_replied_media(message: Message, bot: Bot) -> bool:
-    """Any reply from the Business owner requests the replied-to media.
-
-    No special command is needed. Telegram may omit the media payload on
-    view-once messages; when absent, only already-cached media can be sent.
-    """
     owner = await business_owner(message)
     replied = message.reply_to_message
     if not owner or not message.from_user or message.from_user.id != owner:
@@ -925,22 +741,17 @@ async def capture_replied_media(message: Message, bot: Bot) -> bool:
     if not replied:
         return False
 
-    # --- ГЛАВНАЯ ПРОВЕРКА: ТОЛЬКО ОДНОРАЗОВЫЕ (ИЛИ ЗАЩИЩЁННЫЕ) ---
-    # Если в ответе нет флага has_protected_content — это обычное сообщение, игнорируем.
-    # Telethon видит одноразовые по ttl_seconds, а Bot API — по has_protected_content.
     is_protected = getattr(replied, 'has_protected_content', False)
-    
     item = (replied.photo[-1] if replied.photo else replied.video or replied.voice or
             replied.video_note or replied.document or replied.audio or replied.animation or replied.sticker)
     ttl = getattr(item, 'ttl_seconds', None)
 
+    # Строгий режим: реагируем только на защищённые и одноразовые сообщения.
     if not is_protected and not ttl:
-        # Это обычное фото/видео. Не сохраняем.
         media_diagnostic(message, 'reply', 'not_view_once_ignored',
                          f'type={replied.content_type}; protected={is_protected}; ttl={ttl}')
         return False
 
-    # Ответ на стикер не вызывает немедленную пересылку: только удаление.
     if replied.sticker:
         return False
         
@@ -963,7 +774,6 @@ async def capture_replied_media(message: Message, bot: Bot) -> bool:
     media_diagnostic(message, 'reply', 'view_once_detected',
                      f'replied_id={replied_id}; protected={is_protected}; ttl={ttl}; file_id={has_file_id}')
 
-    # Если Telegram прислал файл в ответе, но мы его ещё не скачали — качаем.
     if kind and has_file_id and not has_local_copy:
         try:
             cache_message = replied.model_copy(update={'business_connection_id': connection_id})
@@ -1017,7 +827,6 @@ async def capture_replied_media(message: Message, bot: Bot) -> bool:
             logger.exception('Reply media capture failed')
         return True
 
-    # Если в ответе не было медиа, но оно есть в кэше — достаём из кэша
     if saved and (saved['file_id'] or saved['local_path']):
         from aiogram.types import FSInputFile
         src = (FSInputFile(saved['local_path']) if saved['local_path']
@@ -1046,8 +855,8 @@ async def capture_replied_media(message: Message, bot: Bot) -> bool:
             except Exception as exc:
                 logger.warning('Unable to send replied media from cache: %s', exc)
     return True
+
 def _antimute_supported(message: Message) -> bool:
-    # Leave albums, commands, forwarded messages and protected content alone.
     if getattr(message, 'media_group_id', None):
         return False
     if getattr(message, 'forward_origin', None) or getattr(message, 'forward_from', None) or getattr(message, 'forward_from_chat', None):
@@ -1104,7 +913,6 @@ async def _send_antimute_copy(message: Message, bot: Bot, *, include_reply: bool
 
 
 async def _copy_owner_message_for_antimute(message: Message, bot: Bot) -> bool:
-    # Replace an eligible owner message only after Telegram confirms the copy.
     if not message.business_connection_id or not is_owner_message(message):
         return False
     key = (message.business_connection_id, message.chat.id)
@@ -1112,7 +920,6 @@ async def _copy_owner_message_for_antimute(message: Message, bot: Bot) -> bool:
 
     async with ANTIMUTE_LOCK:
         now = time.monotonic()
-        # Ignore updates produced by messages this handler itself sent.
         for old_key, expiry in list(ANTIMUTE_COPIES.items()):
             if expiry <= now:
                 ANTIMUTE_COPIES.pop(old_key, None)
@@ -1132,7 +939,7 @@ async def _copy_owner_message_for_antimute(message: Message, bot: Bot) -> bool:
             recent.popleft()
         if len(recent) >= ANTIMUTE_LIMIT_PER_MINUTE:
             logger.warning('Antimute rate limit reached: connection=%s chat=%s', key[0], key[1])
-            return True  # Do not delete the original if no replacement was sent.
+            return True
 
         try:
             try:
@@ -1147,7 +954,6 @@ async def _copy_owner_message_for_antimute(message: Message, bot: Bot) -> bool:
                 )
                 if not reply_missing:
                     raise
-                # Original reply target is no longer available: send a standalone copy.
                 sent = await _send_antimute_copy(message, bot, include_reply=False)
 
             if not sent or not getattr(sent, 'message_id', None):
@@ -1165,7 +971,6 @@ async def _copy_owner_message_for_antimute(message: Message, bot: Bot) -> bool:
                     logger.warning('Antimute copy sent but original deletion was not confirmed: chat=%s id=%s',
                                    message.chat.id, message.message_id)
             except Exception:
-                # Copy is already confirmed; deletion failure leaves the original intact.
                 logger.exception('Antimute copy sent, but original deletion failed: chat=%s id=%s',
                                  message.chat.id, message.message_id)
             logger.info('Antimute replacement sent: connection=%s chat=%s original=%s replacement=%s',
@@ -1179,14 +984,9 @@ async def _copy_owner_message_for_antimute(message: Message, bot: Bot) -> bool:
 
 @dp.business_message()
 async def business_message(message: Message, bot: Bot):
-    # Cache incoming messages/media silently for possible future deletion/edit.
-    # Any owner reply to media triggers a save/send attempt below.
-    # Owner's own messages are not archived.
     if not is_owner_message(message):
         save_message(message)
         if not media_kind(message):
-            # Official Bot API may represent view-once media as a placeholder
-            # with no usable file_id. Record metadata only, not message text.
             hints = []
             for field in ('has_media_spoiler', 'ttl_seconds', 'view_once'):
                 value = getattr(message, field, None)
@@ -1194,10 +994,6 @@ async def business_message(message: Message, bot: Bot):
                     hints.append(f'{field}={value}')
             media_diagnostic(message, 'incoming', 'no_media_payload',
                              f'type={message.content_type}; ' + ','.join(hints))
-        # Cache incoming media quietly before deletion. Never forward ordinary
-        # media on arrival; it is delivered only after a deletion update.
-        # The sender can mark a message as protected; this flag does not
-        # grant the bot access to view-once file bytes.
         if media_kind(message):
             item = (message.photo[-1] if message.photo else message.video or message.voice or
                     message.video_note or message.document or message.audio or message.animation or message.sticker)
@@ -1211,15 +1007,10 @@ async def business_message(message: Message, bot: Bot):
                 media_diagnostic(message, media_kind(message) or 'media', 'incoming_media_not_cached',
                                  f'type={message.content_type}; file_id_available={bool(getattr(item, "file_id", None))}; '
                                  f'file_size={getattr(item, "file_size", None)}')
-    # Commands are handled first, so replying to media with .antimute or another
-    # command cannot accidentally invoke the replied-media path.
     if await handle_business_command(message, bot):
         return
-    # Process antimute before the optional replied-media capture. This also
-    # catches our own replacement-message IDs and prevents replacement loops.
     if is_owner_message(message) and await _copy_owner_message_for_antimute(message, bot):
         return
-    # Existing replied-media behavior remains when antimute did not handle it.
     if is_owner_message(message) and message.reply_to_message:
         await capture_replied_media(message, bot)
     with db() as con:
@@ -1231,7 +1022,6 @@ async def business_message(message: Message, bot: Bot):
 
 
 def quote_block(value, placeholder='Сообщение без текста', limit=1500):
-    """Telegram native expandable? No: standard blockquote supported by HTML Bot API."""
     text = str(value or placeholder).strip()[:limit]
     return '<blockquote>' + escape(text) + '</blockquote>'
 
@@ -1261,7 +1051,6 @@ def render_design(section, default_text):
 
 
 async def show_screen(callback, text, markup, section=None):
-    """Edit in place, including images; replace message only when Telegram can't change media type."""
     if not callback.message:
         return
     design, shown = render_design(section, text) if section else ({'photo_id': None}, text)
@@ -1277,7 +1066,6 @@ async def show_screen(callback, text, markup, section=None):
                 await msg.delete()
                 await msg.answer_photo(photo_id, caption=caption, parse_mode='HTML', reply_markup=markup)
         elif has_photo:
-            # Keep the old photo when changing screen: no extra message.
             await msg.edit_caption(caption=shown[:1024], parse_mode='HTML', reply_markup=markup)
         else:
             await msg.edit_text(shown[:4096], reply_markup=markup, parse_mode='HTML', disable_web_page_preview=True)
@@ -1288,7 +1076,15 @@ async def show_screen(callback, text, markup, section=None):
 
 async def send_home(message):
     name = escape(message.from_user.first_name or 'друг') if message.from_user else 'друг'
-    default = f'Привет, {name}!\n\nВыберите раздел:'
+    default = (
+        f'<b>HADES SAVE</b> <i>— Твой цифровой сейф</i>\n'
+        f'━━━━━━━━━━━━━━━━━━\n\n'
+        f'👋 Привет, <b>{name}</b>!\n'
+        f'Я сохраняю историю переписок, даже если собеседник удалил сообщение.\n\n'
+        f'<blockquote>🔸 <b>Управляй ботом</b> через кнопки ниже\n'
+        f'🔸 <b>Смотри архив</b> в красивом Mini App</blockquote>\n\n'
+        f'<i>Выбери действие:</i>'
+    )
     design, text = render_design('home', default)
     if design['photo_id']:
         await message.answer_photo(design['photo_id'], caption=text[:1024], parse_mode='HTML', reply_markup=menu(message.from_user.id))
@@ -1297,7 +1093,6 @@ async def send_home(message):
 
 
 def identity_label(row, fallback_chat=None):
-    # Match PHP senderLabel: readable name + @username when known.
     if row is None:
         return f'собеседник (чат {fallback_chat})' if fallback_chat else 'неизвестен'
     name = row['sender_name'] or (str(row['sender_id']) if row['sender_id'] else None)
@@ -1311,7 +1106,6 @@ def identity_label(row, fallback_chat=None):
 
 
 def deleted_keyboard(chat_id, username=None, restore=None):
-    """Only jump to chat and, for deletions, restore to that chat."""
     if username:
         url = 'https://t.me/' + str(username).lstrip('@')
     elif chat_id and int(chat_id) > 0:
@@ -1327,7 +1121,6 @@ def deleted_keyboard(chat_id, username=None, restore=None):
 
 
 def describe_content(message: Message) -> str:
-    """Readable representation of any content, even when no text is present."""
     if message.text:
         return message.text
     if message.caption:
@@ -1354,8 +1147,6 @@ async def edited_business_message(message: Message, bot: Bot):
             FROM messages WHERE connection_id=? AND chat_id=? AND message_id=?''',
             (message.business_connection_id,message.chat.id,message.message_id)).fetchone()
     old_text = old['text'] if old else None
-    # No archived original means the original text cannot be recovered.
-    # Some edits only change the caption or include non-text media.
     old_type = None
     if old is not None:
         with db() as con:
@@ -1381,17 +1172,21 @@ async def edited_business_message(message: Message, bot: Bot):
     await store_media(message,bot)
     if owner and prefs(owner['user_id'])['edits']:
         author = user_card(current, message.chat.id)
-        body = (f'✏️ <b>Изменено сообщение от {author}:</b>'
-                f'\n\n<b>Было:</b> {quote_block(old_text, "Исходный текст недоступен")}'
-                f'\n\n<b>Стало:</b> {quote_block(new_text)}')
+        body = (
+            f'📝 <b>СООБЩЕНИЕ ИЗМЕНЕНО</b>\n'
+            f'━━━━━━━━━━━━━━━━━━\n'
+            f'👤 <b>Отправитель:</b> {author}\n\n'
+            f'🔴 <b>Было:</b>\n{quote_block(old_text, "Исходный текст недоступен")}\n\n'
+            f'🟢 <b>Стало:</b>\n{quote_block(new_text)}'
+        )
         await owner_alert(bot,message.business_connection_id,body,parse_mode='HTML',
                           reply_markup=deleted_keyboard(message.chat.id,
                               (current['chat_username'] or current['sender_username']) if current else None))
-        # No automatic media duplicate on edit; text notification is sufficient.
 
 
 @dp.deleted_business_messages()
 async def deleted_business_messages(event: BusinessMessagesDeleted, bot: Bot):
+    logger.info(f"!!! DELETED EVENT RECEIVED: connection={event.business_connection_id}, chat={event.chat.id}, msg_ids={event.message_ids}")
     with db() as con:
         for message_id in event.message_ids:
             con.execute('''UPDATE messages SET deleted=1,updated_at=CURRENT_TIMESTAMP
@@ -1407,30 +1202,9 @@ async def deleted_business_messages(event: BusinessMessagesDeleted, bot: Bot):
             (event.business_connection_id,event.chat.id,*event.message_ids)).fetchall() if event.message_ids else []
     if not owner or not prefs(owner['user_id'])['deletions']:
         return
-    # The Bot API deletion update contains IDs only. If a message was never
-    # delivered to the bot (or was delivered without a usable payload), don't
-    # silently drop the deletion event: send a truthful metadata-only notice.
-    known_ids = {int(row['message_id']) for row in rows}
-    missing_ids = [int(mid) for mid in event.message_ids if int(mid) not in known_ids]
-    for missing_id in missing_ids:
-        try:
-            body = ('🗑 <b>Сообщение удалено</b>\n\n'
-                    'HadesSave не получил содержимое этого сообщения до удаления, '
-                    'поэтому восстановить его текст или медиа не удалось.')
-            await bot.send_message(
-                owner['user_id'], body,
-                reply_markup=deleted_keyboard(event.chat.id, getattr(event.chat, 'username', None)),
-                parse_mode='HTML', disable_web_page_preview=True)
-            media_diagnostic(
-                Message.model_construct(
-                    business_connection_id=event.business_connection_id,
-                    chat=event.chat, message_id=missing_id, content_type='unknown'),
-                'deletion', 'missing_message_snapshot',
-                f'message_id={missing_id}; deletion_update_had_no_content')
-        except Exception:
-            logger.exception('Cannot notify about deleted message without a saved snapshot')
+    
     for row in rows:
-        # Skip notifications for the Business owner's own messages.
+        # Не отправляем уведомление, если удалил сам владелец.
         if row['sender_id'] is None or row['sender_id'] == owner['user_id']:
             continue
         sender = identity_label(row,event.chat.id)
@@ -1441,29 +1215,33 @@ async def deleted_business_messages(event: BusinessMessagesDeleted, bot: Bot):
         ct = row['content_type']
         available_file_id = row['file_id'] or raw_message_file_id(row['raw_json'], ct)
         media_present = bool((row['local_path'] and Path(row['local_path']).is_file()) or available_file_id)
-        body = (f'🗑 <b>Удалено сообщение от {author}:</b>\n\n'
-                + quote_block(content,limit=2800))
+        
+        body = (
+            f'🚨 <b>УДАЛЕНО СООБЩЕНИЕ</b>\n'
+            f'━━━━━━━━━━━━━━━━━━\n'
+            f'👤 <b>Отправитель:</b> {author}\n'
+            f'🕒 <b>Время:</b> {datetime.now().strftime("%H:%M")}\n\n'
+            f'{quote_block(content,limit=2800)}'
+        )
+        
         if ct in ('photo','video','voice','video_note','sticker','animation','document','audio') and media_present:
-            # Deliver the deleted file only now, with controls attached to the
-            # media message whenever that media type supports a caption.
             from aiogram.types import FSInputFile
             src = (FSInputFile(row['local_path']) if row['local_path'] and Path(row['local_path']).is_file() else available_file_id)
             if src and prefs(owner['user_id'])['deleted_media']:
                 try:
-                    kw = dict(reply_markup=keyboard, business_connection_id=None)
-                    kw.pop('business_connection_id')
+                    kw = dict(reply_markup=keyboard)
                     if ct == 'photo':
-                        await bot.send_photo(owner['user_id'],src,caption=f'🗑 Фото удалено.\nОтправитель: {author}',parse_mode='HTML',**kw)
+                        await bot.send_photo(owner['user_id'],src,caption=body,parse_mode='HTML',**kw)
                     elif ct == 'video':
-                        await bot.send_video(owner['user_id'],src,caption=f'🗑 Видео удалено.\nОтправитель: {author}',parse_mode='HTML',**kw)
+                        await bot.send_video(owner['user_id'],src,caption=body,parse_mode='HTML',**kw)
                     elif ct == 'voice':
-                        await bot.send_voice(owner['user_id'],src,caption=f'🗑 Голосовое удалено.\nОтправитель: {author}',parse_mode='HTML',**kw)
+                        await bot.send_voice(owner['user_id'],src,caption=body,parse_mode='HTML',**kw)
                     elif ct == 'animation':
-                        await bot.send_animation(owner['user_id'],src,caption=f'🗑 GIF удалён.\nОтправитель: {author}',parse_mode='HTML',**kw)
+                        await bot.send_animation(owner['user_id'],src,caption=body,parse_mode='HTML',**kw)
                     elif ct == 'document':
-                        await bot.send_document(owner['user_id'],src,caption=f'🗑 Файл удалён.\nОтправитель: {author}',parse_mode='HTML',**kw)
+                        await bot.send_document(owner['user_id'],src,caption=body,parse_mode='HTML',**kw)
                     elif ct == 'audio':
-                        await bot.send_audio(owner['user_id'],src,caption=f'🗑 Аудио удалено.\nОтправитель: {author}',parse_mode='HTML',**kw)
+                        await bot.send_audio(owner['user_id'],src,caption=body,parse_mode='HTML',**kw)
                     elif ct == 'video_note':
                         await bot.send_video_note(owner['user_id'],src)
                         await bot.send_message(owner['user_id'],body,reply_markup=keyboard,parse_mode='HTML')
@@ -1482,7 +1260,6 @@ async def deleted_business_messages(event: BusinessMessagesDeleted, bot: Bot):
 
 @dp.callback_query(F.data.startswith('restore:'))
 async def restore_deleted_message(callback: CallbackQuery, bot: Bot):
-    """Restore previously deleted content using the authorized connection."""
     try:
         _, message_id_raw, chat_id_raw = (callback.data or '').split(':', 2)
         message_id, chat_id = int(message_id_raw), int(chat_id_raw)
@@ -1540,17 +1317,20 @@ def menu(uid=None):
         with db() as con:
             connected = con.execute('SELECT COUNT(*) FROM connections WHERE user_id=? AND enabled=1', (uid,)).fetchone()[0]
         if not connected:
-            rows.append([('🚀 Подключить HadesSave', 'menu:setup')])
+            rows.append([InlineKeyboardButton(text='🚀 Подключить HadesSave', callback_data='menu:setup')])
+    
+    web_app_url = "https://hadessavemod-art.github.io/hadesApp/" 
+    
     rows.extend([
-        [('🤖 Мой HadesSave', 'menu:profile')],
-        [('🗑 Удалённые', 'menu:deleted'), ('ℹ️ Изменённые', 'menu:edited')],
-        [('💬 Команды', 'menu:commands'), ('📈 Статистика', 'menu:statistics')],
-        [('🎁 Пригласить друга', 'menu:invite')],
-        [('⚙️ Настройки', 'menu:settings')],
-        [('💎 HadesSave Premium', 'menu:premium')],
-        [('💡 Поддержка', 'menu:support')],
+        [InlineKeyboardButton(text='📱 Открыть HadesSave', web_app=WebAppInfo(url=web_app_url))],
+        [InlineKeyboardButton(text='🗑 Удалённые', callback_data='menu:deleted'), InlineKeyboardButton(text='ℹ️ Изменённые', callback_data='menu:edited')],
+        [InlineKeyboardButton(text='💬 Команды', callback_data='menu:commands'), InlineKeyboardButton(text='📈 Статистика', callback_data='menu:statistics')],
+        [InlineKeyboardButton(text='🎁 Пригласить друга', callback_data='menu:invite')],
+        [InlineKeyboardButton(text='⚙️ Настройки', callback_data='menu:settings')],
+        [InlineKeyboardButton(text='💎 HadesSave Premium', callback_data='menu:premium')],
+        [InlineKeyboardButton(text='💡 Поддержка', callback_data='menu:support')],
     ])
-    return kb(*rows)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def setup_keyboard(username):
@@ -1565,7 +1345,7 @@ def setup_keyboard(username):
 
 
 def command_keyboard():
-    commands = ['info', 'mute', 'unmute', 'spam', 'archive', 'ref', 'premium', 'support', 'settings', 'mediacheck']
+    commands = ['info', 'mute', 'unmute', 'spam', 'archive', 'ref', 'settings', 'mediacheck']
     rows = []
     for i in range(0, len(commands), 3):
         rows.append([InlineKeyboardButton(text=('.' if cmd in ('info','mute','unmute','spam') else '/') + cmd,
@@ -1578,11 +1358,9 @@ COMMAND_INFO = {
     'info': ('.info', 'Показывает информацию о собеседнике. Используй в переписке.'),
     'mute': ('.mute', 'Включает удаление новых входящих сообщений в выбранном чате.'),
     'unmute': ('.unmute', 'Выключает режим mute в выбранном чате.'),
-    'spam': ('.spam [N] [текст]', 'Отправляет N копий текста. Лимит: 20 сообщений (Premium — 50), не более 20 слов; задержка перед повтором. Кнопка «Стоп» и команда .bspam пока не реализованы.'),
+    'spam': ('.spam [N] [текст]', 'Отправляет N копий текста. Лимит: 20 сообщений (Premium — 50), не более 20 слов; задержка перед повтором.'),
     'archive': ('/archive', 'Показывает последние 15 сообщений из твоего архива.'),
     'ref': ('/ref', 'Показывает реферальную ссылку и число приглашённых.'),
-    'premium': ('/premium', 'Показывает Premium и тарифы Telegram Stars.'),
-    'support': ('/support Текст вопроса', 'Отправляет обращение в поддержку.'),
     'settings': ('/settings', 'Настройки уведомлений.'),
     'mediacheck': ('/mediacheck', 'Диагностика получения и отправки медиа.'),
 }
@@ -1656,55 +1434,16 @@ async def referral(message: Message, bot: Bot):
     with db() as con:
         count = con.execute('SELECT COUNT(*) FROM referrals WHERE referrer_id=?',(message.from_user.id,)).fetchone()[0]
     me = await bot.get_me()
-    await message.answer(f'👥 Приглашено: {count}\nТвоя ссылка: https://t.me/{me.username}?start=ref_{message.from_user.id}')
-
-
-@dp.message(Command('premium'))
-async def premium(message: Message):
-    if not message.from_user:
-        return
-    with db() as con:
-        row = con.execute('SELECT expires_at FROM premium WHERE user_id=?',(message.from_user.id,)).fetchone()
-    status = f"Активен до {row['expires_at']} UTC" if row and datetime.fromisoformat(row['expires_at']) > datetime.now(timezone.utc) else 'Не активен'
-    buttons = [[InlineKeyboardButton(text=f'⭐ {days} дней — {stars} Stars', callback_data=f'buy:{days}')] for days, stars in ((7,50),(14,100),(30,300))]
-    await message.answer(f'⭐ Premium: {status}',reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-
-
-@dp.callback_query(F.data.startswith('buy:'))
-async def buy(callback: CallbackQuery, bot: Bot):
-    days = int(callback.data.split(':')[1])
-    plans = {7:50,14:100,30:300}
-    if days not in plans:
-        return await callback.answer('Тариф не найден', show_alert=True)
-    await bot.send_invoice(chat_id=callback.from_user.id,title=f'Premium на {days} дней',description='Подписка Premium',payload=f'premium:{days}',provider_token='',currency='XTR',prices=[LabeledPrice(label=f'{days} дней',amount=plans[days])])
-    await callback.answer()
-
-
-@dp.pre_checkout_query()
-async def checkout(query: PreCheckoutQuery):
-    await query.answer(ok=query.invoice_payload in {'premium:7','premium:14','premium:30'})
-
-
-@dp.message(F.successful_payment)
-async def paid(message: Message):
-    if not message.from_user or not message.successful_payment:
-        return
-    payload = message.successful_payment.invoice_payload
-    if not payload.startswith('premium:'):
-        return
-    try:
-        days = int(payload.split(':')[1])
-    except ValueError:
-        return
-    if days not in (7,14,30) or message.successful_payment.currency != 'XTR' or message.successful_payment.total_amount != {7:50,14:100,30:300}[days]:
-        return
-    with db() as con:
-        old = con.execute('SELECT expires_at FROM premium WHERE user_id=?',(message.from_user.id,)).fetchone()
-        now = datetime.now(timezone.utc)
-        start = max(now,datetime.fromisoformat(old['expires_at'])) if old else now
-        expires = (start + timedelta(days=days)).isoformat()
-        con.execute('INSERT INTO premium(user_id,expires_at) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET expires_at=excluded.expires_at',(message.from_user.id,expires))
-    await message.answer(f'⭐ Premium активирован до {expires}')
+    text = (screen('ПРИГЛАШЕНИЯ', 'Вместе удобнее') + 
+            f'\n\n👥 <b>Приглашено друзей:</b> {count}\n\n'
+            f'🔗 <b>Твоя персональная ссылка:</b>\n<code>https://t.me/{escape(me.username or "")}?start=ref_{message.from_user.id}</code>\n\n'
+            f'<b>Условия:</b>\n'
+            f'1. Отправь ссылку другу.\n'
+            f'2. Друг запускает бота.\n'
+            f'3. Друг <b>подключает бота</b> в настройках Telegram.\n'
+            f'4. <b>Вы оба</b> получаете <b>+1 день Premium</b>!\n\n'
+            f'<i>Нажми на ссылку, чтобы скопировать её.</i>')
+    await message.answer(text, parse_mode='HTML')
 
 
 @dp.message(Command('settings'))
@@ -1729,54 +1468,388 @@ async def toggle(callback: CallbackQuery):
         await callback.message.answer('🔔 Уведомления '+('включены' if value else 'выключены'))
 
 
-@dp.message(Command('support'))
-async def support(message: Message):
-    if not message.from_user:
-        return
-    parts = (message.text or '').split(maxsplit=1)
-    if len(parts)<2:
-        return await message.answer('🆘 Напиши: /support Текст твоего обращения')
-    with db() as con:
-        con.execute('INSERT INTO support(user_id,body) VALUES(?,?)',(message.from_user.id,parts[1][:3000]))
-    await message.answer('✅ Обращение сохранено.')
-    await alert(message.bot,f'🆘 Обращение от {message.from_user.id}: {parts[1][:2500]}')
+# --- АДМИН-ПАНЕЛЬ БОТА ---
+
+def admin_main_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='📊 Общая статистика', callback_data='adm:stats')],
+        [InlineKeyboardButton(text='📢 Сделать рассылку', callback_data='adm:broadcast')],
+        [InlineKeyboardButton(text='💎 Выдать Premium', callback_data='adm:grant')],
+        [InlineKeyboardButton(text='🛡 Управление ролями', callback_data='adm:roles')],
+        [InlineKeyboardButton(text='🎨 Оформление UI', callback_data='adm:ui')],
+    ])
+
+ADMIN_UI_SECTIONS = {
+    'home': '🏠 Главное меню', 'commands': '💬 Команды',
+    'support': '💡 Поддержка', 'statistics': '📈 Статистика',
+    'settings': '⚙️ Настройки', 'premium': '💎 Premium',
+    'deleted': '🗑 Удалённые', 'edited': 'ℹ️ Изменённые',
+    'setup': '🚀 Подключение', 'profile': '🤖 Мой HadesSave',
+    'invite': '🎁 Пригласить друга',
+}
+
+def admin_ui_keyboard():
+    buttons = [InlineKeyboardButton(text=label, callback_data='adm:ui_section:' + section)
+               for section, label in ADMIN_UI_SECTIONS.items()]
+    return InlineKeyboardMarkup(inline_keyboard=[buttons[i:i+2] for i in range(0, len(buttons), 2)] + [[InlineKeyboardButton(text='↩ Назад', callback_data='adm:home')]])
+
+def admin_ui_section_keyboard(section):
+    return kb([('🖼 Загрузить фото', 'adm:photo:'+section)],
+              [('✏️ Изменить текст', 'adm:text:'+section)],
+              [('👁 Предпросмотр', 'adm:preview:'+section)],
+              [('🗑 Удалить фото', 'adm:remove_photo:'+section)],
+              [('🧹 Сбросить текст', 'adm:remove_text:'+section)],
+              [('↩ Назад', 'adm:ui')])
 
 
-@dp.message(Command('broadcast'))
-async def broadcast(message: Message, bot: Bot):
-    if not message.from_user or message.from_user.id != ADMIN_ID or not ADMIN_ID:
+@dp.message(Command('admin'))
+async def admin_panel(message: Message):
+    if not message.from_user or message.from_user.id != ADMIN_ID:
         return
-    parts = (message.text or '').split(maxsplit=1)
-    if len(parts)<2:
-        return await message.answer('Используй: /broadcast текст рассылки')
+    ADMIN_ACTIONS.pop(message.from_user.id, None) 
+    
+    text = (
+        f'👑 <b>HADES SAVE — ADMIN PANEL</b>\n'
+        f'━━━━━━━━━━━━━━━━━━\n'
+        f'<i>Добро пожаловать, Создатель.</i>\n\n'
+        f'<blockquote>Здесь ты управляешь всей системой.</blockquote>'
+    )
+    
+    await message.answer(text, parse_mode='HTML', reply_markup=admin_main_keyboard())
+
+
+@dp.callback_query(F.data.startswith('adm:'))
+async def admin_callbacks(call: CallbackQuery, bot: Bot):
+    if not call.from_user or call.from_user.id != ADMIN_ID:
+        return await call.answer('Нет доступа', show_alert=True)
+    
+    parts = call.data.split(':')
+    action = parts[1] if len(parts) > 1 else 'home'
+    
+    if action == 'home':
+        await call.answer()
+        ADMIN_ACTIONS.pop(call.from_user.id, None)
+        text = (
+            f'👑 <b>HADES SAVE — ADMIN PANEL</b>\n'
+            f'━━━━━━━━━━━━━━━━━━\n'
+            f'<i>Добро пожаловать, Создатель.</i>\n\n'
+            f'<blockquote>Здесь ты управляешь всей системой.</blockquote>'
+        )
+        return await call.message.edit_text(text, parse_mode='HTML', reply_markup=admin_main_keyboard())
+
+    elif action == 'stats':
+        await call.answer('Собираем данные...')
+        with db() as con:
+            users = con.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+            conns = con.execute('SELECT COUNT(*) FROM connections WHERE enabled=1').fetchone()[0]
+            msgs = con.execute('SELECT COUNT(*) FROM messages').fetchone()[0]
+            deleted = con.execute('SELECT COUNT(*) FROM messages WHERE deleted=1').fetchone()[0]
+            prem = con.execute('SELECT COUNT(*) FROM premium WHERE expires_at > ?', (datetime.now(timezone.utc).isoformat(),)).fetchone()[0]
+            media = con.execute('SELECT COUNT(*) FROM media_files').fetchone()[0]
+        
+        text = (
+            screen('ОБЩАЯ СТАТИСТИКА', f'Обновлено: {datetime.now().strftime("%H:%M:%S")}') +
+            f'\n\n👥 <b>Пользователи:</b> {users}' +
+            f'\n🔌 <b>Активных подключений:</b> {conns}' +
+            f'\n💎 <b>Premium подписок:</b> {prem}' +
+            f'\n\n💬 <b>Всего сообщений:</b> {msgs}' +
+            f'\n🗑 <b>Удалено:</b> {deleted}' +
+            f'\n📎 <b>Медиа в кэше:</b> {media}'
+        )
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text='🔄 Обновить', callback_data='adm:stats')],
+            [InlineKeyboardButton(text='↩ В главное меню', callback_data='adm:home')]
+        ])
+        await call.message.edit_text(text, parse_mode='HTML', reply_markup=markup)
+
+    elif action == 'broadcast':
+        await call.answer()
+        ADMIN_ACTIONS[call.from_user.id] = {'action': 'waiting_broadcast'}
+        text = (
+            screen('РАССЫЛКА', 'Шаг 1 из 2') +
+            '\n\nОтправь мне <b>любое сообщение</b> (текст, фото, видео, гиф, голосовое, кружок и т.д.), которое нужно разослать всем пользователям.'
+        )
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='❌ Отмена', callback_data='adm:home')]])
+        await call.message.edit_text(text, parse_mode='HTML', reply_markup=markup)
+
+    elif action.startswith('run_broadcast_'):
+        await call.answer('Запускаем!')
+        msg_id = int(parts[2])
+        ADMIN_ACTIONS.pop(call.from_user.id, None)
+        
+        await call.message.edit_text('⏳ <b>Рассылка запущена...</b>\n\nПожалуйста, подожди.', parse_mode='HTML')
+        
+        with db() as con:
+            user_ids = [r['id'] for r in con.execute('SELECT id FROM users').fetchall()]
+        
+        success = 0
+        blocked = 0
+        errors = 0
+        
+        for i, uid in enumerate(user_ids):
+            try:
+                await bot.copy_message(chat_id=uid, from_chat_id=call.from_user.id, message_id=msg_id)
+                success += 1
+            except TelegramForbiddenError:
+                blocked += 1
+            except Exception:
+                errors += 1
+            
+            if (i + 1) % 20 == 0:
+                await call.message.edit_text(
+                    f'⏳ <b>Рассылка в процессе...</b>\n\n'
+                    f'Отправлено: {i+1} из {len(user_ids)}\n'
+                    f'✅ Успешно: {success}\n'
+                    f'🚫 Заблокировали: {blocked}\n'
+                    f'⚠️ Ошибок: {errors}', 
+                    parse_mode='HTML'
+                )
+            await asyncio.sleep(0.05)
+            
+        final_text = (
+            screen('РАССЫЛКА ЗАВЕРШЕНА') +
+            f'\n\n📊 <b>Итоги:</b>'
+            f'\n✅ Успешно доставлено: {success}'
+            f'\n🚫 Заблокировали бота: {blocked}'
+            f'\n⚠️ Ошибок: {errors}'
+        )
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='↩ В главное меню', callback_data='adm:home')]])
+        await call.message.edit_text(final_text, parse_mode='HTML', reply_markup=markup)
+
+    elif action == 'grant':
+        await call.answer()
+        ADMIN_ACTIONS[call.from_user.id] = {'action': 'waiting_grant'}
+        text = (
+            screen('ВЫДАЧА PREMIUM', 'Шаг 1 из 1') +
+            '\n\nОтправь мне сообщение в формате:\n'
+            '<code>ID или @юзернейм Количество_дней</code>\n\n'
+            'Примеры:\n'
+            '<code>7831720836 30</code>\n'
+            '<code>@nonLuks 7</code>'
+        )
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='❌ Отмена', callback_data='adm:home')]])
+        await call.message.edit_text(text, parse_mode='HTML', reply_markup=markup)
+
+    elif action == 'roles':
+        await call.answer()
+        ADMIN_ACTIONS[call.from_user.id] = {'action': 'waiting_role'}
+        text = (
+            screen('УПРАВЛЕНИЕ РОЛЯМИ', 'Шаг 1 из 1') +
+            '\n\nОтправь мне сообщение в формате:\n'
+            '<code>ID или @юзернейм роль</code>\n\n'
+            'Доступные роли: <code>owner</code>, <code>admin</code>, <code>aboba</code>\n'
+            'Чтобы снять роль, напиши: <code>ID или @юзернейм none</code>\n\n'
+            'Примеры:\n'
+            '<code>7831720836 owner</code>\n'
+            '<code>@nonLuks admin</code>'
+        )
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='❌ Отмена', callback_data='adm:home')]])
+        await call.message.edit_text(text, parse_mode='HTML', reply_markup=markup)
+
+    elif action == 'ui':
+        await call.answer()
+        text = '🎨 <b>Выбери раздел для оформления:</b>'
+        await call.message.edit_text(text, parse_mode='HTML', reply_markup=admin_ui_keyboard())
+        
+    elif action == 'ui_section':
+        section = parts[2]
+        if section not in ADMIN_UI_SECTIONS:
+            return await call.answer('Раздел не найден', show_alert=True)
+        await call.answer()
+        design = get_design(section)
+        text = (f'🎨 <b>{ADMIN_UI_SECTIONS[section]}</b>\n\n🖼 Фото: '+('установлено' if design['photo_id'] else 'не установлено')+
+                '\n✏️ Текст: '+('свой' if design['custom_text'] is not None else 'стандартный'))
+        await call.message.edit_text(text, parse_mode='HTML', reply_markup=admin_ui_section_keyboard(section))
+
+    elif action in ('photo', 'text'):
+        section = parts[2]
+        with db() as con:
+            con.execute('INSERT INTO admin_edit_state(user_id,section,mode) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET section=excluded.section,mode=excluded.mode',
+                        (call.from_user.id, section, action))
+        await call.answer()
+        await call.message.edit_text(f'🎨 <b>{ADMIN_UI_SECTIONS[section]}</b>\n\n'+
+                                 ('Отправь мне фотографию следующим сообщением.' if action == 'photo' else
+                                  'Отправь новый текст следующим сообщением (можно HTML-разметку).'),
+                                 parse_mode='HTML', reply_markup=kb([('↩ Отмена', 'adm:ui_section:'+section)]))
+                                 
+    elif action in ('remove_photo', 'remove_text'):
+        section = parts[2]
+        with db() as con:
+            con.execute('INSERT OR IGNORE INTO ui_design(section) VALUES(?)', (section,))
+            col = 'photo_id' if action == 'remove_photo' else 'custom_text'
+            con.execute(f'UPDATE ui_design SET {col}=NULL WHERE section=?', (section,))
+        await call.answer('Сохранено')
+        design = get_design(section)
+        text = (f'🎨 <b>{ADMIN_UI_SECTIONS[section]}</b>\n\n🖼 Фото: '+('установлено' if design['photo_id'] else 'не установлено')+
+                '\n✏️ Текст: '+('свой' if design['custom_text'] is not None else 'стандартный'))
+        await call.message.edit_text(text, parse_mode='HTML', reply_markup=admin_ui_section_keyboard(section))
+
+    elif action == 'preview':
+        section = parts[2]
+        await call.answer()
+        design = get_design(section)
+        txt = design['custom_text'] or f'{ADMIN_UI_SECTIONS[section]}\n\nТекст раздела по умолчанию.'
+        if design['photo_id']:
+            await call.message.answer_photo(design['photo_id'], caption=txt[:1024], parse_mode='HTML')
+        else:
+            await call.message.answer(txt[:4096], parse_mode='HTML')
+
+
+@dp.message(F.chat.type == 'private', F.photo)
+async def admin_photo_upload(message: Message):
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
     with db() as con:
-        ids = [r['id'] for r in con.execute('SELECT id FROM users').fetchall()]
-    success=0
-    for uid in ids:
+        row = con.execute('SELECT section,mode FROM admin_edit_state WHERE user_id=?',(message.from_user.id,)).fetchone()
+        if not row or row['mode'] != 'photo':
+            return
+        section=row['section']
+        con.execute('INSERT OR IGNORE INTO ui_design(section) VALUES(?)',(section,))
+        con.execute('UPDATE ui_design SET photo_id=? WHERE section=?',(message.photo[-1].file_id, section))
+        con.execute('DELETE FROM admin_edit_state WHERE user_id=?',(message.from_user.id,))
+    await message.answer(f'✅ Фото для раздела «{ADMIN_UI_SECTIONS[section]}» сохранено.', reply_markup=admin_ui_section_keyboard(section))
+
+
+@dp.message(F.chat.type == 'private', F.text)
+async def admin_text_upload(message: Message):
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    with db() as con:
+        row = con.execute('SELECT section,mode FROM admin_edit_state WHERE user_id=?',(message.from_user.id,)).fetchone()
+        if not row or row['mode'] != 'text':
+            return
+        section=row['section']
+        con.execute('INSERT OR IGNORE INTO ui_design(section) VALUES(?)',(section,))
+        con.execute('UPDATE ui_design SET custom_text=? WHERE section=?',(escape(message.text[:4000]),section))
+        con.execute('DELETE FROM admin_edit_state WHERE user_id=?',(message.from_user.id,))
+    await message.answer(f'✅ Текст для раздела «{ADMIN_UI_SECTIONS[section]}» сохранён.', reply_markup=admin_ui_section_keyboard(section))
+
+
+@dp.message(F.chat.type == 'private')
+async def admin_state_handler(message: Message, bot: Bot):
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    
+    state = ADMIN_ACTIONS.get(message.from_user.id)
+    if not state:
+        return 
+
+    action = state.get('action')
+
+    if action == 'waiting_broadcast':
+        ADMIN_ACTIONS[message.from_user.id]['action'] = 'confirm_broadcast'
+        ADMIN_ACTIONS[message.from_user.id]['msg_id'] = message.message_id
+        
+        text = '👀 <b>Предпросмотр рассылки:</b>\n\nВот что получат пользователи. Всё верно?'
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text='✅ Начать рассылку', callback_data=f'adm:run_broadcast_{message.message_id}')],
+            [InlineKeyboardButton(text='❌ Отмена', callback_data='adm:home')]
+        ])
+        await message.answer(text, parse_mode='HTML', reply_markup=markup)
+        return
+
+    elif action == 'waiting_grant':
+        if not message.text:
+            return await message.answer('❌ Пожалуйста, отправь текст в формате: ID или @юзернейм Дни')
+        
+        ADMIN_ACTIONS.pop(message.from_user.id, None)
+        parts = (message.text or '').split()
+        if len(parts) != 2:
+            return await message.answer('❌ Неверный формат. Нужно: <code>ID/Username Дни</code>', parse_mode='HTML')
+        
+        target, days_str = parts
         try:
-            await bot.send_message(uid,parts[1][:4096]); success+=1
+            days = int(days_str)
+            if days < 1 or days > 3650: raise ValueError
+        except ValueError:
+            return await message.answer('❌ Неверное количество дней (от 1 до 3650).')
+
+        target_id = None
+        if target.startswith('@'):
+            username = target[1:]
+            with db() as con:
+                row = con.execute('SELECT id FROM users WHERE username = ?', (username,)).fetchone()
+                if row: target_id = row['id']
+        else:
+            try:
+                target_id = int(target)
+            except ValueError:
+                pass
+        
+        if not target_id:
+            return await message.answer('❌ Пользователь с таким ID/юзернеймом не найден в базе.')
+
+        expires = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+        with db() as con:
+            con.execute('INSERT INTO premium(user_id,expires_at) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET expires_at=excluded.expires_at', (target_id, expires))
+        
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='↩ В главное меню', callback_data='adm:home')]])
+        await message.answer(f'✅ <b>Premium успешно выдан!</b>\n\nПользователь: <code>{target_id}</code>\nСрок: <b>{days} дней</b>\nДействует до: <code>{expires}</code>', parse_mode='HTML', reply_markup=markup)
+        
+        try:
+            await bot.send_message(
+                target_id,
+                f'👑 <b>ПОДПИСКА АКТИВИРОВАНА</b>\n'
+                f'━━━━━━━━━━━━━━━━━━\n'
+                f'Администратор выдал тебе <b>Premium на {days} дней</b>!\n\n'
+                f'<blockquote>Теперь тебе доступен безлимитный архив, расширенные лимиты и уникальная корона в профиле.</blockquote>\n'
+                f'<i>Наслаждайся возможностями HadesSave ✦</i>',
+                parse_mode='HTML'
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление о премиуме пользователю {target_id}: {e}")
+        
+        return
+
+    elif action == 'waiting_role':
+        if not message.text:
+            return await message.answer('❌ Пожалуйста, отправь текст в формате: ID или @юзернейм Роль')
+        
+        ADMIN_ACTIONS.pop(message.from_user.id, None)
+        parts = (message.text or '').split()
+        if len(parts) != 2:
+            return await message.answer('❌ Неверный формат. Нужно: <code>ID/Username роль</code>', parse_mode='HTML')
+        
+        target, role_str = parts
+        role_str = role_str.lower()
+        
+        if role_str not in ('owner', 'admin', 'aboba', 'none'):
+            return await message.answer('❌ Неверная роль. Доступно: owner, admin, aboba, none')
+
+        target_id = None
+        if target.startswith('@'):
+            username = target[1:]
+            with db() as con:
+                row = con.execute('SELECT id FROM users WHERE username = ?', (username,)).fetchone()
+                if row: target_id = row['id']
+        else:
+            try:
+                target_id = int(target)
+            except ValueError:
+                pass
+        
+        if not target_id:
+            return await message.answer('❌ Пользователь с таким ID/юзернеймом не найден в базе.')
+
+        with db() as con:
+            if role_str == 'none':
+                con.execute('DELETE FROM admins WHERE user_id=?', (target_id,))
+                msg = f'✅ Роль снята с пользователя <code>{target_id}</code>.'
+            else:
+                con.execute('INSERT INTO admins(user_id, role) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET role=excluded.role', (target_id, role_str))
+                msg = f'✅ Пользователю <code>{target_id}</code> выдана роль <b>{role_str}</b>.'
+        
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='↩ В главное меню', callback_data='adm:home')]])
+        await message.answer(msg, parse_mode='HTML', reply_markup=markup)
+        
+        try:
+            if role_str == 'none':
+                await bot.send_message(target_id, "⛔ <b>АДМИН-ДОСТУП ОТОЗВАН</b>\nВаш доступ к админ-панели HadesSave отозван.", parse_mode='HTML')
+            else:
+                await bot.send_message(target_id, f"👑 <b>АДМИН-ДОСТУП ВЫДАН</b>\nВам выдан доступ с префиксом <b>{role_str}</b>.\nЗайдите в Mini App -> Профиль -> Админ-панель.", parse_mode='HTML')
         except Exception:
             pass
-        await asyncio.sleep(0.05)
-    await message.answer(f'Рассылка завершена: {success}/{len(ids)}')
-
-
-@dp.message(Command('grant'))
-async def grant(message: Message):
-    if not message.from_user or message.from_user.id != ADMIN_ID or not ADMIN_ID:
         return
-    parts = (message.text or '').split()
-    if len(parts)!=3:
-        return await message.answer('Используй: /grant USER_ID DAYS')
-    try:
-        uid,days=int(parts[1]),int(parts[2])
-        if days < 1 or days > 3650: raise ValueError
-    except ValueError:
-        return await message.answer('Неверный ID или срок')
-    expires=(datetime.now(timezone.utc)+timedelta(days=days)).isoformat()
-    with db() as con:
-        con.execute('INSERT INTO premium(user_id,expires_at) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET expires_at=excluded.expires_at',(uid,expires))
-    await message.answer(f'⭐ Premium выдан пользователю {uid} до {expires}')
 
 
 @dp.callback_query(F.data.startswith('menu:'))
@@ -1858,19 +1931,35 @@ async def menu_callback(callback: CallbackQuery, bot: Bot):
     elif section == 'premium':
         with db() as con:
             row = con.execute('SELECT expires_at FROM premium WHERE user_id=?',(uid,)).fetchone()
-        text = (screen('PREMIUM', 'Особые возможности HadesSave') + f'\n\n⭐ <b>Подписка:</b> {escape(row["expires_at"] if row else "не активна")}\n\n💫 <b>Выбери подходящий тариф:</b>\nОплата через Telegram Stars 👇')
-        markup = kb([('💎 7 дней · 50 ⭐', 'buy:7')], [('💎 14 дней · 100 ⭐', 'buy:14')], [('💎 30 дней · 300 ⭐', 'buy:30')], [('📜 Условия', 'menu:premium_terms'), ('🆘 Оплата', 'menu:payment_support')], [('🏠 Главное меню', 'menu:home')])
-    elif section == 'premium_terms':
-        text = (screen('УСЛОВИЯ PREMIUM', 'Прозрачные тарифы') + '\n\n💎 <b>7 дней</b> · 50 ⭐\n💎 <b>14 дней</b> · 100 ⭐\n💎 <b>30 дней</b> · 300 ⭐\n\n<i>Отдельные функции оригинального Premium пока недоступны.</i>')
-        markup = kb([('💎 Тарифы', 'menu:premium')], [('🏠 Главное меню', 'menu:home')])
-    elif section in ('support','payment_support'):
-        text = (screen('ПОДДЕРЖКА', 'Мы на связи') + '\n\n💬 <b>Нужна помощь?</b>\nОпиши проблему одной командой:\n\n<code>/support Твой вопрос</code>\n\n<i>Чем точнее описание, тем проще помочь.</i>')
-        markup = kb([('💳 Вопрос об оплате', 'menu:payment_support')] if section=='support' else [('🆘 Общая поддержка', 'menu:support')], [('🏠 Главное меню', 'menu:home')])
+        text = (screen('PREMIUM', 'Особые возможности HadesSave') + 
+                f'\n\n⭐ <b>Подписка:</b> {escape(row["expires_at"] if row else "не активна")}\n\n'
+                f'💫 <b>Покупка Premium доступна только в Mini App.</b>\n\n'
+                f'👇 Нажмите кнопку ниже, чтобы перейти.')
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text='🛒 Купить в Mini App', web_app=WebAppInfo(url="https://hadessavemod-art.github.io/hadesApp/#premium"))],
+            [InlineKeyboardButton(text='🏠 Главное меню', callback_data='menu:home')]
+        ])
+    elif section == 'support':
+        text = (screen('ПОДДЕРЖКА', 'Связь с администратором') + 
+                '\n\n💬 Нажмите на кнопку ниже, чтобы написать нам.\n\n'
+                '<i>Обычно отвечаем в течение дня.</i>')
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text='✍️ Написать в поддержку', url='https://t.me/Hades_save_men')],
+            [InlineKeyboardButton(text='🏠 Главное меню', callback_data='menu:home')]
+        ])
     elif section in ('invite','ref'):
         me = await bot.get_me()
         with db() as con:
             count = con.execute('SELECT COUNT(*) FROM referrals WHERE referrer_id=?',(uid,)).fetchone()[0]
-        text = (screen('ПРИГЛАШЕНИЯ', 'Вместе удобнее') + f'\n\n👥 <b>Приглашено друзей:</b> {count}\n\n🔗 <b>Твоя персональная ссылка:</b>\n<code>https://t.me/{escape(me.username or "")}?start=ref_{uid}</code>\n\n<i>Нажми на ссылку, чтобы скопировать её.</i>')
+        text = (screen('ПРИГЛАШЕНИЯ', 'Вместе удобнее') + 
+                f'\n\n👥 <b>Приглашено друзей:</b> {count}\n\n'
+                f'🔗 <b>Твоя персональная ссылка:</b>\n<code>https://t.me/{escape(me.username or "")}?start=ref_{uid}</code>\n\n'
+                f'<b>Условия:</b>\n'
+                f'1. Отправь ссылку другу.\n'
+                f'2. Друг запускает бота.\n'
+                f'3. Друг <b>подключает бота</b> в настройках Telegram (Настройки → Чат-боты).\n'
+                f'4. <b>Вы оба</b> получаете <b>+1 день Premium</b>!\n\n'
+                f'<i>Нажми на ссылку, чтобы скопировать её.</i>')
     elif section == 'profile':
         with db() as con:
             count = con.execute('SELECT COUNT(*) FROM connections WHERE user_id=? AND enabled=1',(uid,)).fetchone()[0]
@@ -1882,123 +1971,8 @@ async def menu_callback(callback: CallbackQuery, bot: Bot):
     await show_screen(callback, text, markup, section=section)
 
 
-ADMIN_SECTIONS = {
-    'home': '🏠 Главное меню', 'commands': '💬 Команды',
-    'support': '💡 Поддержка', 'statistics': '📈 Статистика',
-    'settings': '⚙️ Настройки', 'premium': '💎 Premium',
-    'deleted': '🗑 Удалённые', 'edited': 'ℹ️ Изменённые',
-    'setup': '🚀 Подключение', 'profile': '🤖 Мой HadesSave',
-    'invite': '🎁 Пригласить друга',
-}
-
-
-def admin_allowed(uid):
-    return bool(ADMIN_ID) and uid == ADMIN_ID
-
-
-def admin_keyboard():
-    buttons = [InlineKeyboardButton(text=label, callback_data='adm:section:' + section)
-               for section, label in ADMIN_SECTIONS.items()]
-    return InlineKeyboardMarkup(inline_keyboard=[buttons[i:i+2] for i in range(0, len(buttons), 2)])
-
-
-def admin_section_keyboard(section):
-    return kb([('🖼 Загрузить фото', 'adm:photo:'+section)],
-              [('✏️ Изменить текст', 'adm:text:'+section)],
-              [('👁 Предпросмотр', 'adm:preview:'+section)],
-              [('🗑 Удалить фото', 'adm:remove_photo:'+section)],
-              [('🧹 Сбросить текст', 'adm:remove_text:'+section)],
-              [('↩ Назад', 'adm:home')])
-
-
-@dp.message(Command('admin'))
-async def admin_panel(message: Message):
-    if not message.from_user or not admin_allowed(message.from_user.id):
-        return
-    await message.answer('👑 <b>HadesSave — Админ-панель</b>\n\nВыбери раздел для оформления:',
-                         parse_mode='HTML', reply_markup=admin_keyboard())
-
-
-@dp.callback_query(F.data.startswith('adm:'))
-async def admin_callbacks(call: CallbackQuery):
-    if not admin_allowed(call.from_user.id):
-        return await call.answer('Нет доступа', show_alert=True)
-    parts = call.data.split(':')
-    action = parts[1] if len(parts)>1 else 'home'
-    section = parts[2] if len(parts)>2 else None
-    if action == 'home':
-        await call.answer()
-        return await show_screen(call, '👑 <b>HadesSave — Админ-панель</b>\n\nВыбери раздел для оформления:', admin_keyboard())
-    if section not in ADMIN_SECTIONS:
-        return await call.answer('Раздел не найден', show_alert=True)
-    if action in ('photo','text'):
-        with db() as con:
-            con.execute('INSERT INTO admin_edit_state(user_id,section,mode) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET section=excluded.section,mode=excluded.mode',
-                        (call.from_user.id,section,action))
-        await call.answer()
-        return await show_screen(call, f'🎨 <b>{ADMIN_SECTIONS[section]}</b>\n\n'+
-                                 ('Отправь мне фотографию следующим сообщением.' if action == 'photo' else
-                                  'Отправь новый текст следующим сообщением (можно HTML-разметку).'),
-                                 kb([('↩ Отмена', 'adm:section:'+section)]))
-    if action in ('remove_photo','remove_text'):
-        with db() as con:
-            con.execute('INSERT OR IGNORE INTO ui_design(section) VALUES(?)', (section,))
-            col = 'photo_id' if action == 'remove_photo' else 'custom_text'
-            con.execute(f'UPDATE ui_design SET {col}=NULL WHERE section=?', (section,))
-        await call.answer('Сохранено')
-    else:
-        await call.answer()
-    with db() as con:
-        con.execute('DELETE FROM admin_edit_state WHERE user_id=?',(call.from_user.id,))
-    design=get_design(section)
-    if action == 'preview':
-        # Shows the actual installed image; regular navigation uses this same design.
-        txt=design['custom_text'] or f'{ADMIN_SECTIONS[section]}\n\nТекст раздела по умолчанию.'
-        if design['photo_id']:
-            await call.message.answer_photo(design['photo_id'], caption=txt[:1024], parse_mode='HTML')
-        else:
-            await call.message.answer(txt[:4096], parse_mode='HTML')
-    await show_screen(call,
-        f'🎨 <b>{ADMIN_SECTIONS[section]}</b>\n\n🖼 Фото: '+('установлено' if design['photo_id'] else 'не установлено')+
-        '\n✏️ Текст: '+('свой' if design['custom_text'] is not None else 'стандартный'),
-        admin_section_keyboard(section))
-
-
-@dp.message(F.chat.type == 'private', F.photo)
-async def admin_photo_upload(message: Message):
-    if not message.from_user or not admin_allowed(message.from_user.id):
-        return
-    with db() as con:
-        row = con.execute('SELECT section,mode FROM admin_edit_state WHERE user_id=?',(message.from_user.id,)).fetchone()
-        if not row or row['mode'] != 'photo':
-            return
-        section=row['section']
-        con.execute('INSERT OR IGNORE INTO ui_design(section) VALUES(?)',(section,))
-        con.execute('UPDATE ui_design SET photo_id=? WHERE section=?',(message.photo[-1].file_id, section))
-        con.execute('DELETE FROM admin_edit_state WHERE user_id=?',(message.from_user.id,))
-    await message.answer(f'✅ Фото для раздела «{ADMIN_SECTIONS[section]}» сохранено.',
-                         reply_markup=admin_section_keyboard(section))
-
-
-@dp.message(F.chat.type == 'private', F.text)
-async def admin_text_upload(message: Message):
-    if not message.from_user or not admin_allowed(message.from_user.id):
-        return
-    with db() as con:
-        row = con.execute('SELECT section,mode FROM admin_edit_state WHERE user_id=?',(message.from_user.id,)).fetchone()
-        if not row or row['mode'] != 'text':
-            return
-        section=row['section']
-        con.execute('INSERT OR IGNORE INTO ui_design(section) VALUES(?)',(section,))
-        # Escape raw text: no untrusted/broken HTML in captions.
-        con.execute('UPDATE ui_design SET custom_text=? WHERE section=?',(escape(message.text[:4000]),section))
-        con.execute('DELETE FROM admin_edit_state WHERE user_id=?',(message.from_user.id,))
-    await message.answer(f'✅ Текст для раздела «{ADMIN_SECTIONS[section]}» сохранён.',
-                         reply_markup=admin_section_keyboard(section))
-
-
-
 async def main():
+    global BOT_USERNAME
     if not TOKEN:
         raise SystemExit('Укажи BOT_TOKEN в переменных окружения')
     with db():
@@ -2006,6 +1980,9 @@ async def main():
     logger.info('Starting HadesSave build %s; media_dir=%s; unmarked_reply_capture=%s',
                 BUILD_ID, MEDIA_DIR, CAPTURE_UNMARKED_REPLIED_MEDIA)
     bot = Bot(TOKEN)
+    me = await bot.get_me()
+    BOT_USERNAME = me.username
+    
     mtproto_task = None
     try:
         from hades_mtproto_bridge import run_mtproto_bridge
