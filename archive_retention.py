@@ -1,57 +1,73 @@
-"""Seven-day rolling retention for archived Business messages and downloaded media."""
 import asyncio
 import logging
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 log = logging.getLogger('hades.retention')
 
-
-def cleanup(db, media_dir):
-    root = Path(media_dir).resolve()
-    paths = []
-    n = 0
-    with db() as con:
-        cols = {r[1] for r in con.execute('PRAGMA table_info(messages)')}
-        if 'archived_at' not in cols:
-            con.execute('ALTER TABLE messages ADD COLUMN archived_at TEXT')
-            con.execute('UPDATE messages SET archived_at=COALESCE(updated_at,CURRENT_TIMESTAMP) WHERE archived_at IS NULL')
-        con.execute('CREATE INDEX IF NOT EXISTS idx_messages_archived_at ON messages(archived_at)')
-        con.execute('CREATE TEMP TABLE IF NOT EXISTS _expired (connection_id TEXT, chat_id INTEGER, message_id INTEGER, PRIMARY KEY(connection_id,chat_id,message_id))')
-        con.execute('DELETE FROM _expired')
-        con.execute("""INSERT OR IGNORE INTO _expired SELECT connection_id,chat_id,message_id FROM messages
-            WHERE datetime(COALESCE(archived_at,updated_at)) <= datetime('now','-7 days')""")
-        n = con.execute('SELECT COUNT(*) FROM _expired').fetchone()[0]
-        paths = [r[0] for r in con.execute('''SELECT local_path FROM media_files mf WHERE local_path IS NOT NULL AND
-            EXISTS(SELECT 1 FROM _expired e WHERE e.connection_id=mf.connection_id AND e.chat_id=mf.chat_id AND e.message_id=mf.message_id)''')]
-        for table in ('media_files','message_versions','reply_captures'):
-            con.execute(f'''DELETE FROM {table} WHERE EXISTS(SELECT 1 FROM _expired e
-                WHERE e.connection_id={table}.connection_id AND e.chat_id={table}.chat_id AND e.message_id={table}.message_id)''')
-        con.execute('''DELETE FROM messages WHERE EXISTS(SELECT 1 FROM _expired e
-            WHERE e.connection_id=messages.connection_id AND e.chat_id=messages.chat_id AND e.message_id=messages.message_id)''')
-        con.execute("DELETE FROM media_diagnostics WHERE datetime(created_at) <= datetime('now','-7 days')")
-        con.execute("DELETE FROM business_update_diagnostics WHERE datetime(created_at) <= datetime('now','-7 days')")
-        con.execute('DELETE FROM _expired')
-    removed = 0
-    for path in set(paths):
-        try:
-            file = Path(path).resolve()
-            if not file.is_relative_to(root) or not file.is_file():
-                continue
-            with db() as con:
-                still_used = con.execute('SELECT 1 FROM media_files WHERE local_path=? LIMIT 1',(str(file),)).fetchone()
-            if not still_used:
-                file.unlink()
-                removed += 1
-        except OSError:
-            log.exception('Failed to remove expired media')
-    if n:
-        log.info('Deleted %d expired archive messages and %d media files',n,removed)
-
-
 async def cleanup_loop(db, media_dir):
+    """Фоновая очистка: удаляет старые сообщения и файлы.
+    Для премиум-пользователей хранит 30 дней, для остальных 3 дня.
+    """
+    media_dir = Path(media_dir).resolve()
+    media_dir.mkdir(parents=True, exist_ok=True)
+    
     while True:
         try:
-            await asyncio.to_thread(cleanup, db, media_dir)
-        except Exception:
-            log.exception('Archive retention cleanup failed')
-        await asyncio.sleep(3600)
+            await asyncio.sleep(3600)  # раз в час
+            now = datetime.now(timezone.utc)
+            
+            with db() as con:
+                # Получаем премиум-пользователей
+                prem_rows = con.execute('SELECT user_id, expires_at FROM premium').fetchall()
+                prem_users = set()
+                for r in prem_rows:
+                    try:
+                        if datetime.fromisoformat(r['expires_at']) > now:
+                            prem_users.add(r['user_id'])
+                    except Exception:
+                        pass
+                
+                # Получаем все соединения
+                conns = con.execute('SELECT id, user_id FROM connections').fetchall()
+                
+                for conn in conns:
+                    conn_id = conn['id']
+                    uid = conn['user_id']
+                    days = 30 if uid in prem_users else 3
+                    cutoff = (now - timedelta(days=days)).isoformat()
+                    
+                    # Удаляем старые сообщения
+                    con.execute(
+                        'DELETE FROM messages WHERE connection_id=? AND updated_at < ?',
+                        (conn_id, cutoff)
+                    )
+                
+                con.commit()
+                
+                # Собираем все файлы, на которые есть ссылки в media_files
+                referenced = set()
+                for row in con.execute('SELECT local_path FROM media_files WHERE local_path IS NOT NULL AND local_path != ""'):
+                    p = Path(row['local_path']).resolve()
+                    if p.is_file():
+                        referenced.add(p)
+                    else:
+                        con.execute('DELETE FROM media_files WHERE local_path=?', (row['local_path'],))
+                
+                con.commit()
+            
+            # Удаляем файлы, на которые нет ссылок
+            for file in media_dir.rglob('*'):
+                if file.is_file() and file not in referenced:
+                    try:
+                        file.unlink()
+                    except Exception:
+                        pass
+            
+            log.info('Retention cleanup completed')
+            
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.exception('Retention error: %s', e)
+            await asyncio.sleep(60)
